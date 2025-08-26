@@ -1,10 +1,25 @@
-# 下载ManiSkill的官方demo数据集
-python -m mani_skill.utils.download_demo ${ENV_ID}
-# python -m mani_skill.utils.download_demo # with no args this prints all available datasets
+## Deployment
 
-# 3. 使用ManiSkill的官方例程Replay并转换数据集
-# Replay demonstrations with control_mode=pd_joint_delta_pos
-python -m mani_skill.trajectory.replay_trajectory \
-  --traj-path demos/StackCube-v1/motionplanning/trajectory.h5 \
-  --save-traj --target-control-mode pd_joint_delta_pos \
-  --obs-mode rgb --count 100
+克隆本仓库：
+```bash
+  git clone https://github.com/Zihan-W/ManiSkill3_Baselines.git
+```
+
+安装依赖：
+```bash
+  cd ManiSkill3_Baselines
+  pip install -r requirements.txt
+  pip install -e .
+```
+
+登录wandb：
+```bash
+  wandb login --relogin
+  # continue to login your wandb account
+```
+
+运行PPO baseline：
+
+    运行ppo_rgbd.py即可，注意修改文件中的args参数
+    默认actor为CLIP编码，critic为ResNet50编码
+    首次运行会下载ResNet50的权重文件

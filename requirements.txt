@@ -1,0 +1,7 @@
+mani_skill
+gymnasium
+torch
+tensorboard
+wandb
+tyro
+clip @ git+https://github.com/openai/CLIP.git
