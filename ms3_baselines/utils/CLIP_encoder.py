@@ -6,6 +6,10 @@ import torch.nn as nn
 from PIL import Image
 from torchvision.transforms.functional import to_pil_image
 import torchvision.transforms.functional as TF
+import torch.nn.functional as F
+
+clip_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1,3,1,1)
+clip_std  = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1,3,1,1)
 
 class CLIPValueHead(nn.Module):
     def __init__(self, instruction, sample_obs, cam_mode=1, use_state=True, hidden=512, dist=False, n_quant=51):
@@ -175,7 +179,6 @@ class CLIPValueHead(nn.Module):
             z = torch.cat([fused_features, sim1, sim2, state_emb], dim=-1)  # [N, D + 128 + D] = [N, 1537]
             v1 = self.net(z).squeeze(-1)  # [N]
             v2 = self.net2(z).squeeze(-1)  # [N]
-            import ipdb;ipdb.set_trace()
             alpha = 0.5
             v = alpha * v1 + (1 - alpha) * v2
             return v
@@ -233,6 +236,39 @@ class CLIPValueHead(nn.Module):
         img2 = torch.stack(_img2, dim=0).to(self.device)  # [B,3,224,224]
         return img1, img2
 
+    def _2imgs_to_clip_fast(self, obs_dict: torch.Tensor):
+        """
+        输入:
+        obs_dict['rgb']: [B, H, W, C]，其中 C 至少有 6 个通道（前 3 为相机1 RGB，后 3 为相机2 RGB）
+        输出:
+        img1, img2: [B, 3, 224, 224]，已按 CLIP 方式归一化，可直接喂给 model.encode_image(...)
+        """
+        x = obs_dict['rgb'].to(self.device, non_blocking=True)
+        if x.dtype != torch.float32:
+            x = x.float()
+
+        # [0,1] 归一化（兼容已经是 0~1 或 0~255 的情况）
+        if x.max() > 1.5:
+            x = x / 255.0
+
+        # 取两路相机的 RGB （假设前六通道分别是 cam1 RGB、cam2 RGB）
+        # 若你的通道布局不是这样，需要按你的真实布局改 slice
+        x1 = x[..., :3].permute(0, 3, 1, 2).contiguous()   # [B,3,H,W]
+        x2 = x[..., 3:6].permute(0, 3, 1, 2).contiguous()  # [B,3,H,W]
+
+        # 合批做一次插值和归一化，避免两次前处理
+        x12 = torch.cat([x1, x2], dim=0)                   # [2B,3,H,W]
+        x12 = F.interpolate(x12, size=(224, 224), mode="bilinear", align_corners=False)
+
+        mean = clip_mean.to(x12.device, non_blocking=True)
+        std  = clip_std.to(x12.device, non_blocking=True)
+        x12 = (x12 - mean) / std
+
+        B = x1.shape[0]
+        img1 = x12[:B]
+        img2 = x12[B:]
+        return img1, img2
+
 
 class CLIPActionHead(CLIPValueHead):
     def __init__(self, instruction, action_dim, sample_obs, cam_mode=1, use_state=True, hidden=512, dist=False, n_quant=51):
@@ -288,7 +324,7 @@ class CLIPActionHead(CLIPValueHead):
 
     def get_action(self, obs_batch):
         # img1是场景相机，img2是腕部相机
-        img1, img2 = self._2imgs_to_clip(obs_batch)
+        img1, img2 = self._2imgs_to_clip_fast(obs_batch)
         with torch.no_grad():
             fI1 = self.model.encode_image(img1).float()
             fI2 = self.model.encode_image(img2).float()  # [N,D]
