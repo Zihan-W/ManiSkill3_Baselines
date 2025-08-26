@@ -11,30 +11,91 @@ import torch.nn.functional as F
 clip_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1,3,1,1)
 clip_std  = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1,3,1,1)
 
-class CLIPValueHead(nn.Module):
-    def __init__(self, instruction, sample_obs, cam_mode=1, use_state=True, hidden=512, dist=False, n_quant=51):
+class CLIPBase(nn.Module):
+    def __init__(self, instruction, sample_obs, use_state=True):
         super().__init__()
-
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model, self.preprocess = clip.load("ViT-B/32", device=self.device)
-        for p in self.model.parameters(): p.requires_grad = False  # 冻结
+        for p in self.model.parameters(): p.requires_grad = False
+
+        # 作为 buffer，自动跟随 device
+        self.register_buffer("clip_mean", torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1,3,1,1), persistent=False)
+        self.register_buffer("clip_std",  torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1,3,1,1), persistent=False)
 
         self.txt = instruction
         self.txt_tok = clip.tokenize([self.txt]).to(self.device)
         with torch.no_grad():
-            self.fx = self.model.encode_text(self.txt_tok).float()  # (1,D)
+            self.fx = self.model.encode_text(self.txt_tok).float()  # (1, D)
 
-        self.use_state = True
-        state_embed_dim = 0
-        if self.use_state:
-            state_embed_dim = 32
+        self.use_state = use_state
+        self.state_embed_dim = 0
+        if use_state:
             state_dim = sample_obs['state'].shape[-1] if 'state' in sample_obs else 0
+            self.state_embed_dim = 32
             self.state_mlp = nn.Sequential(
                 nn.Linear(state_dim, 64), nn.ReLU(),
-                nn.Linear(64, state_embed_dim), nn.ReLU()
+                nn.Linear(64, self.state_embed_dim), nn.ReLU()
             )
-        else:
-            state_embed_dim = state_dim
+
+    def _to_clip(self, obs_dict: torch.Tensor) -> torch.Tensor:
+        imgs = []
+        # obs: [B,H,W,C]，取前三通道为主视图RGB
+        obs_nhwc = obs_dict['rgb']
+        x = obs_nhwc.to(self.device).float()
+        if x.max() > 1.5: x = x / 255.0
+        x = x[..., :3].permute(0,3,1,2)                  # -> [B,3,H,W]
+        for i in range(x.size(0)):
+            xi = x[i].detach().cpu()                    # [3,H,W] 或 [H,W,3]
+            if xi.dim() == 4: xi = xi[0]
+            if xi.size(0) != 3: xi = xi.permute(2,0,1)  # 保证 [3,H,W]
+            if xi.max() <= 1.0: xi = (xi * 255).byte()
+            pil = TF.to_pil_image(xi)                   # Tensor -> PIL
+            imgs.append(self.preprocess(pil))           # -> [3,224,224] tensor
+        img = torch.stack(imgs, dim=0).to(self.device)  # [B,3,224,224]
+        return img
+
+    def _2imgs_to_clip(self, obs_dict: torch.Tensor) -> torch.Tensor:
+        _img1 = []
+        _img2 = []
+        # obs: [B,H,W,C]，取前三通道为主视图RGB
+        obs_nhwc = obs_dict['rgb']
+        x = obs_nhwc.to(self.device).float()
+        if x.max() > 1.5: x = x / 255.0
+        x1 = x[..., :3].permute(0,3,1,2)                  # -> [B,3,H,W]
+        x2 = x[..., 3:6].permute(0,3,1,2)                  # -> [B,3,H,W]
+        for i in range(x1.size(0)):
+            xi = x1[i].detach().cpu()                    # [3,H,W] 或 [H,W,3]
+            if xi.dim() == 4: xi = xi[0]
+            if xi.size(0) != 3: xi = xi.permute(2,0,1)  # 保证 [3,H,W]
+            if xi.max() <= 1.0: xi = (xi * 255).byte()
+            pil1 = TF.to_pil_image(xi)                   # Tensor -> PIL
+            _img1.append(self.preprocess(pil1))           # -> [3,224,224] tensor
+        for i in range(x2.size(0)):
+            xi = x2[i].detach().cpu()                    # [3,H,W] 或 [H,W,3]
+            if xi.dim() == 4: xi = xi[0]
+            if xi.size(0) != 3: xi = xi.permute(2,0,1)  # 保证 [3,H,W]
+            if xi.max() <= 1.0: xi = (xi * 255).byte()
+            pil = TF.to_pil_image(xi)                   # Tensor -> PIL
+            _img2.append(self.preprocess(pil))           # -> [3,224,224] tensor
+        img1 = torch.stack(_img1, dim=0).to(self.device)  # [B,3,224,224]
+        img2 = torch.stack(_img2, dim=0).to(self.device)  # [B,3,224,224]
+        return img1, img2
+
+    # 你的 fast 预处理，放到基类方便复用
+    def _2imgs_to_clip_fast(self, obs_dict):
+        x = obs_dict['rgb'].to(self.device, non_blocking=True).float()
+        if x.max() > 1.5: x = x / 255.0
+        x1 = x[..., :3].permute(0,3,1,2).contiguous()
+        x2 = x[..., 3:6].permute(0,3,1,2).contiguous()
+        x12 = torch.cat([x1, x2], dim=0)
+        x12 = F.interpolate(x12, size=(224, 224), mode="bilinear", align_corners=False)
+        x12 = (x12 - self.clip_mean) / self.clip_std
+        B = x1.size(0)
+        return x12[:B], x12[B:]
+
+class CLIPValueHead(CLIPBase):
+    def __init__(self, instruction, sample_obs, cam_mode=1, use_state=True, hidden=512, dist=False, n_quant=51):
+        super().__init__(instruction, sample_obs, use_state)
 
         self.cam_mode = cam_mode
         '''
@@ -44,13 +105,13 @@ class CLIPValueHead(nn.Module):
         4: RGB + Wrist RGB + Self-Attention
         '''
         if self.cam_mode == 1:
-            in_dim = 3*self.model.visual.output_dim + state_embed_dim + 1  # img_f, txt_f, similarity
+            in_dim = 3*self.model.visual.output_dim + self.state_embed_dim + 1  # img_f, txt_f, similarity
         elif self.cam_mode == 2:
-            in_dim = (1 * self.model.visual.output_dim) + state_embed_dim + 1
+            in_dim = (1 * self.model.visual.output_dim) + self.state_embed_dim + 1
         elif self.cam_mode == 3:
-            in_dim = 2 * self.model.visual.output_dim + state_embed_dim + 1 + 1
+            in_dim = 2 * self.model.visual.output_dim + self.state_embed_dim + 1 + 1
         elif self.cam_mode == 4:
-            in_dim = self.model.visual.output_dim + state_embed_dim + 1 + 1
+            in_dim = self.model.visual.output_dim + self.state_embed_dim + 1 + 1
             self.attention = nn.MultiheadAttention(embed_dim=self.model.visual.output_dim, num_heads=4, batch_first=True)
         if dist:
             self.net = nn.Sequential(
@@ -85,8 +146,8 @@ class CLIPValueHead(nn.Module):
         self.dist = dist
 
 
-    def forward(self, z):
-        return self.net(z)
+    def forward(self, obs_batch):
+        return self.value(obs_batch)
 
     def value(self, obs_batch):
         if self.cam_mode == 1:
@@ -192,114 +253,16 @@ class CLIPValueHead(nn.Module):
                 img1_probs = logits_img1.cpu().numpy()
                 img2_probs = logits_img2.cpu().numpy()
 
-    def _to_clip(self, obs_dict: torch.Tensor) -> torch.Tensor:
-        imgs = []
-        # obs: [B,H,W,C]，取前三通道为主视图RGB
-        obs_nhwc = obs_dict['rgb']
-        x = obs_nhwc.to(self.device).float()
-        if x.max() > 1.5: x = x / 255.0
-        x = x[..., :3].permute(0,3,1,2)                  # -> [B,3,H,W]
-        for i in range(x.size(0)):
-            xi = x[i].detach().cpu()                    # [3,H,W] 或 [H,W,3]
-            if xi.dim() == 4: xi = xi[0]
-            if xi.size(0) != 3: xi = xi.permute(2,0,1)  # 保证 [3,H,W]
-            if xi.max() <= 1.0: xi = (xi * 255).byte()
-            pil = TF.to_pil_image(xi)                   # Tensor -> PIL
-            imgs.append(self.preprocess(pil))           # -> [3,224,224] tensor
-        img = torch.stack(imgs, dim=0).to(self.device)  # [B,3,224,224]
-        return img
-
-    def _2imgs_to_clip(self, obs_dict: torch.Tensor) -> torch.Tensor:
-        _img1 = []
-        _img2 = []
-        # obs: [B,H,W,C]，取前三通道为主视图RGB
-        obs_nhwc = obs_dict['rgb']
-        x = obs_nhwc.to(self.device).float()
-        if x.max() > 1.5: x = x / 255.0
-        x1 = x[..., :3].permute(0,3,1,2)                  # -> [B,3,H,W]
-        x2 = x[..., 3:6].permute(0,3,1,2)                  # -> [B,3,H,W]
-        for i in range(x1.size(0)):
-            xi = x1[i].detach().cpu()                    # [3,H,W] 或 [H,W,3]
-            if xi.dim() == 4: xi = xi[0]
-            if xi.size(0) != 3: xi = xi.permute(2,0,1)  # 保证 [3,H,W]
-            if xi.max() <= 1.0: xi = (xi * 255).byte()
-            pil1 = TF.to_pil_image(xi)                   # Tensor -> PIL
-            _img1.append(self.preprocess(pil1))           # -> [3,224,224] tensor
-        for i in range(x2.size(0)):
-            xi = x2[i].detach().cpu()                    # [3,H,W] 或 [H,W,3]
-            if xi.dim() == 4: xi = xi[0]
-            if xi.size(0) != 3: xi = xi.permute(2,0,1)  # 保证 [3,H,W]
-            if xi.max() <= 1.0: xi = (xi * 255).byte()
-            pil = TF.to_pil_image(xi)                   # Tensor -> PIL
-            _img2.append(self.preprocess(pil))           # -> [3,224,224] tensor
-        img1 = torch.stack(_img1, dim=0).to(self.device)  # [B,3,224,224]
-        img2 = torch.stack(_img2, dim=0).to(self.device)  # [B,3,224,224]
-        return img1, img2
-
-    def _2imgs_to_clip_fast(self, obs_dict: torch.Tensor):
-        """
-        输入:
-        obs_dict['rgb']: [B, H, W, C]，其中 C 至少有 6 个通道（前 3 为相机1 RGB，后 3 为相机2 RGB）
-        输出:
-        img1, img2: [B, 3, 224, 224]，已按 CLIP 方式归一化，可直接喂给 model.encode_image(...)
-        """
-        x = obs_dict['rgb'].to(self.device, non_blocking=True)
-        if x.dtype != torch.float32:
-            x = x.float()
-
-        # [0,1] 归一化（兼容已经是 0~1 或 0~255 的情况）
-        if x.max() > 1.5:
-            x = x / 255.0
-
-        # 取两路相机的 RGB （假设前六通道分别是 cam1 RGB、cam2 RGB）
-        # 若你的通道布局不是这样，需要按你的真实布局改 slice
-        x1 = x[..., :3].permute(0, 3, 1, 2).contiguous()   # [B,3,H,W]
-        x2 = x[..., 3:6].permute(0, 3, 1, 2).contiguous()  # [B,3,H,W]
-
-        # 合批做一次插值和归一化，避免两次前处理
-        x12 = torch.cat([x1, x2], dim=0)                   # [2B,3,H,W]
-        x12 = F.interpolate(x12, size=(224, 224), mode="bilinear", align_corners=False)
-
-        mean = clip_mean.to(x12.device, non_blocking=True)
-        std  = clip_std.to(x12.device, non_blocking=True)
-        x12 = (x12 - mean) / std
-
-        B = x1.shape[0]
-        img1 = x12[:B]
-        img2 = x12[B:]
-        return img1, img2
 
 
-class CLIPActionHead(CLIPValueHead):
+class CLIPActionHead(CLIPBase):
     def __init__(self, instruction, action_dim, sample_obs, cam_mode=1, use_state=True, hidden=512, dist=False, n_quant=51):
-        super().__init__(instruction, sample_obs, cam_mode, use_state, hidden, dist, n_quant)
-
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model, self.preprocess = clip.load("ViT-B/32", device=self.device)
-        for p in self.model.parameters(): p.requires_grad = False  # 冻结
-
-        self.txt = instruction
-        self.txt_tok = clip.tokenize([self.txt]).to(self.device)
-        with torch.no_grad():
-            self.fx = self.model.encode_text(self.txt_tok).float()  # (1,D)
-
-        self.use_state = True
-        state_embed_dim = 0
-        if self.use_state:
-            state_embed_dim = 32
-            state_dim = sample_obs['state'].shape[-1] if 'state' in sample_obs else 0
-            self.state_mlp = nn.Sequential(
-                nn.Linear(state_dim, 64), nn.ReLU(),
-                nn.Linear(64, state_embed_dim), nn.ReLU()
-            )
-        else:
-            state_embed_dim = state_dim
-
+        super().__init__(instruction, sample_obs, use_state)
         self.cam_mode = cam_mode
         self.action_dim = action_dim
 
         if self.cam_mode == 1:
-            in_dim = 2*self.model.visual.output_dim + state_embed_dim + 2  # img_f, txt_f, similarity
+            in_dim = 2*self.model.visual.output_dim + self.state_embed_dim + 2  # img_f, txt_f, similarity
         if dist:
             self.net = nn.Sequential(
                 nn.Linear(in_dim, hidden),
