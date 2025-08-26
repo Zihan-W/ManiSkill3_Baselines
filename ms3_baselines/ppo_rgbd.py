@@ -33,7 +33,9 @@ class Args:
     use_depth = False
     use_pretrain = False
     actor_ckpt_path = ""
-    vision_type = "ResNet50"  # RGBCNN, RGBDCNN, ResNet50, r3m50(still buggy)
+    vision_type = "RGBCNN"  # RGBCNN, RGBDCNN, ResNet50, r3m50(still buggy)， hil_serl_resnet
+    # 如果选择了hil_serl_resnet，则可进一步选择pooling_method
+    hil_serl_resnet_pooling_method = "spatial_learned_embeddings"   # spatial_learned_embeddings, spatial_softmax, avg, max, none
 
     exp_name: Optional[str] = None
     """the name of this experiment"""
@@ -43,7 +45,7 @@ class Args:
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
     """if toggled, cuda will be enabled by default"""
-    track: bool = True
+    track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
     wandb_project_name: str = "ManiSkill_Baselines"
     """the wandb's project name"""
@@ -70,11 +72,14 @@ class Args:
     """whether to include state information in observations"""
     total_timesteps: int = 10000000
     """total timesteps of the experiments"""
+    actor_learning_rate: float = 2e-4
+    critic_learning_rate: float = 3e-4
+    feature_net_learning_rate: float = 2e-4
     learning_rate: float = 3e-4
     """the learning rate of the optimizer"""
-    num_envs: int = 16
+    num_envs: int = 32
     """the number of parallel environments"""
-    num_eval_envs: int = 8
+    num_eval_envs: int = 16
     """the number of parallel evaluation environments"""
     partial_reset: bool = True
     """whether to let parallel environments reset upon termination instead of truncation"""
@@ -106,7 +111,7 @@ class Args:
     """the surrogate clipping coefficient"""
     clip_vloss: bool = False
     """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
-    ent_coef: float = 0.0
+    ent_coef: float = 0.05
     """coefficient of the entropy"""
     vf_coef: float = 0.7
     """coefficient of the value function"""
@@ -181,12 +186,13 @@ class DictArray(object):
         return DictArray(new_buffer_shape, None, data_dict=new_dict)
 
 class Agent(nn.Module):
-    def __init__(self, envs, sample_obs, vision_type="r3m50"):
+    def __init__(self, envs, sample_obs, args):
         super().__init__()
-        # vision_type: RGBCNN, RGBDCNN, ResNet50, r3m50
-        self.feature_net = FeatureExtractor(sample_obs=sample_obs, vision_type=vision_type)
-        # latent_size = np.array(envs.unwrapped.single_observation_space.shape).prod()
-        latent_size = self.feature_net.out_features
+        # feature for critic
+        self.actor_feature_net = None
+        self.critic_feature_net = FeatureExtractor(sample_obs=sample_obs, args=args)
+        # self.actor_feature_net = FeatureExtractor(sample_obs=sample_obs, args=args)
+        latent_size = self.critic_feature_net.out_features
         self.critic = nn.Sequential(
             layer_init(nn.Linear(latent_size, 512)),
             nn.ReLU(inplace=True),
@@ -197,21 +203,35 @@ class Agent(nn.Module):
         instruction = "a red cube and a green cube"
         action_dim = int(np.prod(envs.unwrapped.single_action_space.shape))
         self.actor_mean = CLIPActionHead(instruction, action_dim, sample_obs, use_state=True)
+        # self.actor_mean = nn.Sequential(
+        #     layer_init(nn.Linear(latent_size, 512)),
+        #     nn.ReLU(inplace=True),
+        #     layer_init(nn.Linear(512, 512)),
+        #     nn.ReLU(inplace=True),
+        #     layer_init(nn.Linear(512, np.prod(envs.unwrapped.single_action_space.shape)), std=0.01*np.sqrt(2)),
+        # )
         self.actor_logstd = nn.Parameter(torch.ones(1, action_dim) * -0.5)
 
-        if vision_type in ["r3m50", "ResNet50"]:
-            for p in self.feature_net.extractors["rgb"].backbone.parameters():
+        if args.vision_type in ["r3m50", "ResNet50", "hil_serl_resnet"]:
+            for p in self.critic_feature_net.extractors["rgb"].backbone.parameters():
                 p.requires_grad = False  # R3M/ResNet骨干
-        for p in self.actor_mean.model.parameters():
-            p.requires_grad = False  # CLIP整模型，再次冻结，以防万一
+
+        if self.actor_feature_net is None:
+            for p in self.actor_mean.model.parameters():
+                p.requires_grad = False  # CLIP整模型，再次冻结，以防万一
+        else:
+            if args.vision_type in ["r3m50", "ResNet50", "hil_serl_resnet"]:
+                for p in self.actor_feature_net.extractors["rgb"].backbone.parameters():
+                    p.requires_grad = False  # R3M/ResNet骨干
 
     def get_features(self, x):
-        return self.feature_net(x)
+        return self.critic_feature_net(x)
     def get_value(self, x):
-        x = self.feature_net(x)
+        x = self.critic_feature_net(x)
         return self.critic(x)
     def get_action(self, x, deterministic=False):
-        # x = self.feature_net(x)
+        if self.actor_feature_net is not None:
+            x = self.actor_feature_net(x)
         action_mean = self.actor_mean(x)
         if deterministic:
             return action_mean
@@ -220,13 +240,17 @@ class Agent(nn.Module):
         probs = Normal(action_mean, action_std)
         return probs.sample()
     def get_action_and_value(self, x, action=None):
-        action_mean = self.actor_mean(x)
+        if self.actor_feature_net is not None:
+            actor_feature = self.actor_feature_net(x)
+        else:
+            actor_feature = x
+        action_mean = self.actor_mean(actor_feature)
         action_logstd = self.actor_logstd.expand_as(action_mean)
         action_std = torch.exp(action_logstd)
         probs = Normal(action_mean, action_std)
         if action is None:
             action = probs.sample()
-        x = self.feature_net(x)
+        x = self.critic_feature_net(x)
         value = self.critic(x)
         return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), value
 
@@ -429,7 +453,7 @@ if __name__ == "__main__":
     print(f"args.num_iterations={args.num_iterations} args.num_envs={args.num_envs} args.num_eval_envs={args.num_eval_envs}")
     print(f"args.minibatch_size={args.minibatch_size} args.batch_size={args.batch_size} args.update_epochs={args.update_epochs}")
     print(f"####")
-    agent = Agent(envs, sample_obs=next_obs, vision_type=args.vision_type).to(device)
+    agent = Agent(envs, sample_obs=next_obs, args=args).to(device)
     if args.use_pretrain:
         actor_ckpt_path = None
         agent.load_actor_from_ckpt(actor_ckpt_path, load_logstd=True, freeze_feature=False)
@@ -439,11 +463,13 @@ if __name__ == "__main__":
     def filt(named):
         return [p for n,p in named if p.requires_grad]
     opt_groups = [
-        {"params": filt(agent.critic.named_parameters()), "lr": 3e-4, "weight_decay": 0.0},
-        {"params": filt(agent.actor_mean.named_parameters()), "lr": 3e-4, "weight_decay": 0.0},
-        {"params": filt(agent.feature_net.named_parameters()), "lr": 1e-4, "weight_decay": 1e-4},
+        {"params": filt(agent.critic.named_parameters()), "lr": args.critic_learning_rate, "weight_decay": 0.0},
+        {"params": filt(agent.actor_mean.named_parameters()), "lr": args.actor_learning_rate, "weight_decay": 0.0},
+        {"params": filt(agent.critic_feature_net.named_parameters()), "lr": args.feature_net_learning_rate, "weight_decay": 1e-4},
         {"params": [agent.actor_logstd], "lr": 3e-4, "weight_decay": 0.0},
     ]
+    if agent.actor_feature_net is not None:
+        opt_groups.append({"params": filt(agent.actor_feature_net.named_parameters()), "lr": args.feature_net_learning_rate, "weight_decay": 1e-4})
 
     optimizer = torch.optim.AdamW(opt_groups, betas=(0.9, 0.999), eps=1e-8)
 

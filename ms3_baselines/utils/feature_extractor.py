@@ -17,8 +17,12 @@ def make_mlp(in_channels, mlp_channels, act_builder=nn.ReLU, last_act=True):
         c_in = c_out
     return nn.Sequential(*module_list)
 
+def freeze_model(model: nn.Module):
+    for param in model.parameters():
+        param.requires_grad = False
+
 class FeatureExtractor(nn.Module):
-    def __init__(self, sample_obs, vision_type="RGBCNN"):
+    def __init__(self, sample_obs, args):
         super().__init__()
 
         extractors = {}
@@ -33,7 +37,7 @@ class FeatureExtractor(nn.Module):
             self._use_depth = True
             in_channels += sample_obs["depth"].shape[-1]
 
-        if vision_type == "RGBCNN":
+        if args.vision_type == "RGBCNN":
             # here we use a NatureCNN architecture to process images, but any architecture is permissble here
             cnn = nn.Sequential(
                 nn.Conv2d(
@@ -61,7 +65,7 @@ class FeatureExtractor(nn.Module):
             extractors["rgb"] = nn.Sequential(cnn, fc)
             self.out_features += feature_size
 
-        elif vision_type == "RGBDCNN":
+        elif args.vision_type == "RGBDCNN":
             if self._use_depth is None:
                 raise ValueError("Depth data not found in sample_obs")
             cnn = nn.Sequential(
@@ -93,21 +97,24 @@ class FeatureExtractor(nn.Module):
             extractors["rgb"] = nn.Sequential(cnn, fc)
             self.out_features += feature_size
 
-        elif vision_type == "ResNet50":
-            import torchvision.models as models
-            backbone = models.resnet50(pretrained=True)
-            # 移除ResNet的最后一层（全连接层），只使用卷积部分
-            # backbone.conv1 = nn.Conv2d(
-            #     in_channels=in_channels,
-            #     out_channels=backbone.conv1.out_channels,
-            #     kernel_size=backbone.conv1.kernel_size,
-            #     stride=backbone.conv1.stride,
-            #     padding=backbone.conv1.padding,
-            #     bias=backbone.conv1.bias
-            # )
-            backbone = nn.Sequential(*list(backbone.children())[:-1])
-            for param in backbone.parameters():
-                param.requires_grad = False
+        elif args.vision_type in ["ResNet50", "hil_serl_resnet"]:
+            if args.vision_type == "ResNet50":
+                import torchvision.models as models
+                backbone = models.resnet50(pretrained=True)
+                backbone = nn.Sequential(*list(backbone.children())[:-1])
+                freeze_model(backbone)
+
+            elif args.vision_type == "hil_serl_resnet":
+                from utils.resnet_v1 import resnetv1_configs, PreTrainedResNetEncoder
+                image_size = (sample_obs["rgb"].shape[1], sample_obs["rgb"].shape[2])
+                pretrained_encoder = resnetv1_configs["resnetv1-10-frozen"](image_size=image_size)
+                freeze_model(pretrained_encoder)
+                backbone = PreTrainedResNetEncoder(
+                    pooling_method=args.hil_serl_resnet_pooling_method,
+                    num_spatial_blocks=8,
+                    bottleneck_dim=256,
+                    pretrained_encoder=pretrained_encoder,
+                )
 
             # 推理并获取输出特征的维度
             env_obs = sample_obs["rgb"][..., :3]
@@ -138,7 +145,7 @@ class FeatureExtractor(nn.Module):
                 extractors["rgb"] = TwoCamResNet(backbone, n_flatten, feature_size)
                 self.out_features += feature_size
 
-        elif vision_type == "r3m50":
+        elif args.vision_type == "r3m50":
             class R3MExtractor(nn.Module):
                 '''
                 输入: x [B, C, H, W]，其中 C = 3*cam_num (+ cam_num 如果含 depth)
@@ -164,8 +171,8 @@ class FeatureExtractor(nn.Module):
                         m = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
                         m.fc = nn.Identity()
                         self.backbone = m.eval()
-                    for p in self.backbone.parameters():
-                        p.requires_grad = False
+
+                    freeze_model(self.backbone)
 
                     # 2) depth 编码器（可选）：把 [B, cam_num, H, W] -> 64
                     if self.use_depth:
@@ -216,7 +223,7 @@ class FeatureExtractor(nn.Module):
             extractors["rgb"] = R3MExtractor(self.cam_num, self._use_depth, feature_size)
             self.out_features += feature_size
 
-        elif vision_type == "ResNet50_2":
+        elif args.vision_type == "ResNet50_2":
             # TODO: still buggy
             import torch.nn.functional as F
             from torchvision.models import resnet50, ResNet50_Weights
@@ -242,8 +249,7 @@ class FeatureExtractor(nn.Module):
                         m.layer1, m.layer2, m.layer3, m.layer4,
                         m.avgpool,   # -> [B,2048,1,1]
                     ).eval()
-                    for p in self.backbone.parameters():
-                        p.requires_grad = False
+                    freeze_model(self.backbone)
                     self.out_dim = 2048
 
                     # ImageNet 归一化
