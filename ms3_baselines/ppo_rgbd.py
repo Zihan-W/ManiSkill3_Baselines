@@ -26,7 +26,7 @@ from utils.feature_extractor import FeatureExtractor, layer_init
 from ms3_baselines.utils.pretrain import load_actor_from_ckpt
 
 from ms3_baselines.utils.CLIP_encoder import CLIPActionHead
-
+from ms3_baselines.utils.LSTM_model import LSTMCritic
 @dataclass
 class Args:
     robot_uids: str = "panda_wristcam"
@@ -45,9 +45,9 @@ class Args:
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
     """if toggled, cuda will be enabled by default"""
-    track: bool = False
+    track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "ManiSkill_Baselines"
+    wandb_project_name: str = "ManiSkill_Baselines_LSTM"
     """the wandb's project name"""
     wandb_entity: Optional[str] = None
     """the entity (team) of wandb's project"""
@@ -193,13 +193,15 @@ class Agent(nn.Module):
         self.critic_feature_net = FeatureExtractor(sample_obs=sample_obs, args=args)
         # self.actor_feature_net = FeatureExtractor(sample_obs=sample_obs, args=args)
         latent_size = self.critic_feature_net.out_features
-        self.critic = nn.Sequential(
-            layer_init(nn.Linear(latent_size, 512)),
-            nn.ReLU(inplace=True),
-            layer_init(nn.Linear(512, 512)),
-            nn.ReLU(inplace=True),
-            layer_init(nn.Linear(512, 1)),
-        )
+        # self.critic = nn.Sequential(
+        #     layer_init(nn.Linear(latent_size, 512)),
+        #     nn.ReLU(inplace=True),
+        #     layer_init(nn.Linear(512, 512)),
+        #     nn.ReLU(inplace=True),
+        #     layer_init(nn.Linear(512, 1)),
+        # )
+        self.critic = LSTMCritic(feature_dim=latent_size, pre_mlp_dim=256, lstm_hidden=256, num_layers=1, layernorm_lstm=False)
+
         instruction = "a red cube and a green cube"
         action_dim = int(np.prod(envs.unwrapped.single_action_space.shape))
         self.actor_mean = CLIPActionHead(instruction, action_dim, sample_obs, use_state=True)
@@ -239,20 +241,22 @@ class Agent(nn.Module):
         action_std = torch.exp(action_logstd)
         probs = Normal(action_mean, action_std)
         return probs.sample()
-    def get_action_and_value(self, x, action=None):
-        if self.actor_feature_net is not None:
-            actor_feature = self.actor_feature_net(x)
+    def _policy_dist(self, x):
+        feat = self.actor_feature_net(x) if self.actor_feature_net is not None else x
+        mean = self.actor_mean(feat)
+        std = self.actor_logstd.exp().expand_as(mean)
+        return Normal(mean, std)
+
+    @torch.no_grad()
+    def act(self, x, deterministic=False):
+        dist = self._policy_dist(x)
+        if deterministic:
+            action = dist.mean
         else:
-            actor_feature = x
-        action_mean = self.actor_mean(actor_feature)
-        action_logstd = self.actor_logstd.expand_as(action_mean)
-        action_std = torch.exp(action_logstd)
-        probs = Normal(action_mean, action_std)
-        if action is None:
-            action = probs.sample()
-        x = self.critic_feature_net(x)
-        value = self.critic(x)
-        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), value
+            action = dist.sample()
+        logprob = dist.log_prob(action).sum(-1)
+        entropy = dist.entropy().sum(-1)
+        return action, logprob, entropy
 
 class Logger:
     def __init__(self, log_wandb=False, tensorboard: SummaryWriter = None) -> None:
@@ -462,16 +466,20 @@ if __name__ == "__main__":
     # 只把 requires_grad=True 的参数给优化器
     def filt(named):
         return [p for n,p in named if p.requires_grad]
-    opt_groups = [
-        {"params": filt(agent.critic.named_parameters()), "lr": args.critic_learning_rate, "weight_decay": 0.0},
+    actor_groups = [
         {"params": filt(agent.actor_mean.named_parameters()), "lr": args.actor_learning_rate, "weight_decay": 0.0},
-        {"params": filt(agent.critic_feature_net.named_parameters()), "lr": args.feature_net_learning_rate, "weight_decay": 1e-4},
         {"params": [agent.actor_logstd], "lr": 3e-4, "weight_decay": 0.0},
     ]
     if agent.actor_feature_net is not None:
-        opt_groups.append({"params": filt(agent.actor_feature_net.named_parameters()), "lr": args.feature_net_learning_rate, "weight_decay": 1e-4})
+        actor_groups.append({"params": filt(agent.actor_feature_net.named_parameters()), "lr": args.feature_net_learning_rate, "weight_decay": 1e-4})
 
-    optimizer = torch.optim.AdamW(opt_groups, betas=(0.9, 0.999), eps=1e-8)
+    critic_group =[
+            {"params": filt(agent.critic.named_parameters()), "lr": args.critic_learning_rate, "weight_decay": 0.0},
+            {"params": filt(agent.critic_feature_net.named_parameters()), "lr": args.feature_net_learning_rate, "weight_decay": 1e-4},
+    ]
+
+    optimizer_actor = torch.optim.AdamW(actor_groups, betas=(0.9, 0.999), eps=1e-8)
+    optimizer_critic = torch.optim.AdamW(critic_group, betas=(0.9, 0.999), eps=1e-8)
 
     id2name = {id(p): n for n, p in agent.named_parameters()}
     def show_optimizer(optim):
@@ -482,7 +490,8 @@ if __name__ == "__main__":
             print(f"Group {gi} (lr={g.get('lr', None)}):")
             for n in names:
                 print("  ", n)
-    show_optimizer(optimizer)
+    show_optimizer(optimizer_actor)
+    show_optimizer(optimizer_critic)
 
     if args.checkpoint:
         agent.load_state_dict(torch.load(args.checkpoint))
@@ -538,18 +547,34 @@ if __name__ == "__main__":
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
-            lrnow = frac * args.learning_rate
-            optimizer.param_groups[0]["lr"] = lrnow
+            for g in optimizer_actor.param_groups:  g["lr"]  = frac * args.actor_learning_rate
+            for g in optimizer_critic.param_groups: g["lr"]  = frac * args.critic_learning_rate
         rollout_time = time.perf_counter()
+
+        # LSTM
+        T, B = args.num_steps, args.num_envs
+        feat_buf   = torch.zeros(T, B, agent.critic_feature_net.out_features, device=device)
+        done_buf   = torch.zeros(T, B, device=device)
+        hc_buf_h0  = None  # 本轮序列的起始隐藏态（对每个 env 一份）
+
+        critic_hc = agent.critic.initial_state(batch_size=B, device=device)  # (h, c)
+        hc_buf_h0 = tuple(x.detach().clone() for x in critic_hc)             # 起始态保存
+
         for step in range(0, args.num_steps):
             global_step += args.num_envs
             obs[step] = next_obs
             dones[step] = next_done
+            done_buf[step] = next_done # LSTM
 
             # ALGO LOGIC: action logic
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(next_obs)
-                values[step] = value.flatten()
+                action, logprob, _ = agent.act(next_obs)
+                # LSTM
+                feat_step = agent.critic_feature_net(next_obs)
+                v_t, critic_hc = agent.critic.value_step(feat_step, critic_hc, done_b=next_done)
+                values[step] = v_t.view(-1)
+                feat_buf[step] = feat_step
+
             actions[step] = action
             logprobs[step] = logprob
 
@@ -568,13 +593,22 @@ if __name__ == "__main__":
                 for k in infos["final_observation"]:
                     infos["final_observation"][k] = infos["final_observation"][k][done_mask]
                 with torch.no_grad():
-                    final_values[step, torch.arange(args.num_envs, device=device)[done_mask]] = agent.get_value(infos["final_observation"]).view(-1)
+                    # final_values[step, torch.arange(args.num_envs, device=device)[done_mask]] = agent.get_value(infos["final_observation"]).view(-1)
+                    # 对于截断，我们用“零隐藏态”评估（等价于新开一段）
+                    h0 = agent.critic.initial_state(done_mask.sum().item(), device=device)
+                    f_final = agent.critic_feature_net({k: v[done_mask] for k, v in infos["final_observation"].items()})
+                    v_final, _ = agent.critic.value_step(f_final, h0, done_b=torch.zeros_like(done_mask, dtype=torch.float32, device=device))
+                    idx = torch.arange(B, device=device)[done_mask]
+                    final_values[step, idx] = v_final.view(-1)
 
         rollout_time = time.perf_counter() - rollout_time
         cumulative_times["rollout_time"] += rollout_time
         # bootstrap value according to termination and truncation
         with torch.no_grad():
-            next_value = agent.get_value(next_obs).reshape(1, -1)
+            # next_value = agent.get_value(next_obs).reshape(1, -1)
+            # LSTM
+            f_next = agent.critic_feature_net(next_obs)
+            next_value, _ = agent.critic.value_step(f_next, critic_hc, done_b=torch.zeros_like(next_done))
             advantages = torch.zeros_like(rewards).to(device)
             lastgaelam = 0
             for t in reversed(range(args.num_steps)):
@@ -617,10 +651,6 @@ if __name__ == "__main__":
             returns = advantages + values
 
         # flatten the batch
-        b_obs = obs.reshape((-1,))
-        b_logprobs = logprobs.reshape(-1)
-        b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
-        b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
 
@@ -629,73 +659,98 @@ if __name__ == "__main__":
         b_inds = np.arange(args.batch_size)
         clipfracs = []
         update_time = time.perf_counter()
+
+        # Actor
+        b_obs        = obs.reshape((-1,))
+        b_actions    = actions.reshape((-1,) + envs.single_action_space.shape)
+        b_logprobs   = logprobs.reshape(-1)
+        b_advantages = advantages.reshape(-1)
+
+        actor_clipfracs = []
         for epoch in range(args.update_epochs):
-            np.random.shuffle(b_inds)
+            perm = np.random.permutation(args.batch_size)
             for start in range(0, args.batch_size, args.minibatch_size):
-                end = start + args.minibatch_size
-                mb_inds = b_inds[start:end]
+                mb = perm[start:start+args.minibatch_size]
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
-                logratio = newlogprob - b_logprobs[mb_inds]
+                dist = agent._policy_dist(b_obs[mb])
+                newlogprob = dist.log_prob(b_actions[mb]).sum(-1)
+                entropy = dist.entropy().sum(-1)
+
+                logratio = newlogprob - b_logprobs[mb]
                 ratio = logratio.exp()
-
                 with torch.no_grad():
-                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
-                    old_approx_kl = (-logratio).mean()
                     approx_kl = ((ratio - 1) - logratio).mean()
-                    clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
-
+                    actor_clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
                 if args.target_kl is not None and approx_kl > args.target_kl:
                     break
 
-                mb_advantages = b_advantages[mb_inds]
+                mb_adv = b_advantages[mb]
                 if args.norm_adv:
-                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+                    mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
 
-                # Policy loss
-                pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+                pg_loss1 = -mb_adv * ratio
+                pg_loss2 = -mb_adv * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-
-                # Value loss
-                newvalue = newvalue.view(-1)
-                if args.clip_vloss:
-                    v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
-                    v_clipped = b_values[mb_inds] + torch.clamp(
-                        newvalue - b_values[mb_inds],
-                        -args.clip_coef,
-                        args.clip_coef,
-                    )
-                    v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
-                    v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-                    v_loss = 0.5 * v_loss_max.mean()
-                else:
-                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
-
                 entropy_loss = entropy.mean()
-                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
 
-                optimizer.zero_grad()
-                loss.backward()
+                actor_loss = pg_loss - args.ent_coef * entropy_loss
+
+                optimizer_actor.zero_grad()
+                actor_loss.backward()
                 nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
-                optimizer.step()
+                optimizer_actor.step()
 
             if args.target_kl is not None and approx_kl > args.target_kl:
                 break
+
+        T, B = args.num_steps, args.num_envs
+        ret_TB  = returns.view(T, B)             # [T,B]
+        feat_TBF = feat_buf                      # [T,B,F]
+        done_TB = done_buf                       # [T,B]
+
+        critic_losses = []
+        # 每次挑一批 env 的整段序列
+        batch_envs = max(1, B // args.num_minibatches)
+        env_perm = np.random.permutation(B)
+
+        for start in range(0, B, batch_envs):
+            env_ids = env_perm[start:start+batch_envs]
+
+            feat_seq = feat_TBF[:, env_ids, :]    # [T,Be,F]
+            done_seq = done_TB[:, env_ids]        # [T,Be]
+            ret_seq  = ret_TB[:, env_ids]         # [T,Be]
+
+            # 对应这些 env 的起始隐藏态（来自 rollout 开头保存的 hc_buf_h0）
+            h0 = tuple(x[:, env_ids, :].contiguous() for x in hc_buf_h0)  # (h0,c0), [num_layers, Be, H]
+
+            # 逐步前向（若你有 forward_sequence 就用它）
+            v_preds = []
+            hc = h0
+            for t in range(T):
+                v_t, hc = agent.critic.value_step(feat_seq[t], hc, done_b=done_seq[t])
+                v_preds.append(v_t.view(1, -1))        # [1,Be]
+            v_pred = torch.cat(v_preds, dim=0)         # [T,Be]
+
+            v_loss = 0.5 * (v_pred - ret_seq).pow(2).mean()
+            optimizer_critic.zero_grad()
+            v_loss.backward()
+            nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+            optimizer_critic.step()
+
+            critic_losses.append(v_loss.item())
+
         update_time = time.perf_counter() - update_time
         cumulative_times["update_time"] += update_time
-        y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
+        y_pred, y_true = values.detach().cpu().numpy().reshape(-1), returns.detach().cpu().numpy().reshape(-1)
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
-        logger.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
-        logger.add_scalar("charts/newvalue", newvalue.mean().item(), global_step)
-        logger.add_scalar("losses/value_loss", v_loss.item(), global_step)
+        logger.add_scalar("losses/critic_seq", np.mean(critic_losses), global_step)
+        logger.add_scalar("losses/clipfrac_actor", np.mean(actor_clipfracs), global_step)
         logger.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
         logger.add_scalar("losses/entropy", entropy_loss.item(), global_step)
-        logger.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
         logger.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
-        logger.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
+        logger.add_scalar("losses/clipfrac_actor", np.mean(actor_clipfracs), global_step)
         logger.add_scalar("losses/explained_variance", explained_var, global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         logger.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
@@ -706,7 +761,10 @@ if __name__ == "__main__":
         for k, v in cumulative_times.items():
             logger.add_scalar(f"time/total_{k}", v, global_step)
         logger.add_scalar("time/total_rollout+update_time", cumulative_times["rollout_time"] + cumulative_times["update_time"], global_step)
-
+        # 可选：监控隐藏态范数（rollout 末尾）
+        h_norm = critic_hc[0].norm(dim=-1).mean().item(); c_norm = critic_hc[1].norm(dim=-1).mean().item()
+        logger.add_scalar("critic/h_norm", h_norm, global_step)
+        logger.add_scalar("critic/c_norm", c_norm, global_step)
     if args.save_model and not args.evaluate:
         model_path = f"runs/{run_name}/final_ckpt.pt"
         torch.save(agent.state_dict(), model_path)
