@@ -5,6 +5,7 @@ import random
 import time
 from dataclasses import dataclass
 from typing import Optional
+import copy
 
 import gymnasium as gym
 import numpy as np
@@ -22,7 +23,7 @@ from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper, Flatten
 from mani_skill.utils.wrappers.record import RecordEpisode
 from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 
-from utils.feature_extractor import FeatureExtractor, layer_init
+from utils.feature_extractor import FeatureExtractor, layer_init, freeze_model
 from ms3_baselines.utils.pretrain import load_actor_from_ckpt
 
 from ms3_baselines.utils.CLIP_encoder import CLIPActionHead
@@ -36,6 +37,9 @@ class Args:
     vision_type = "RGBCNN"  # RGBCNN, RGBDCNN, ResNet50, r3m50(still buggy)， hil_serl_resnet
     # 如果选择了hil_serl_resnet，则可进一步选择pooling_method
     hil_serl_resnet_pooling_method = "spatial_learned_embeddings"   # spatial_learned_embeddings, spatial_softmax, avg, max, none
+
+    target_value_tau: float = 0.1         # critic target value网络的软更新系数
+    target_value_interval: int = 1         # 每多少个 PPO 迭代做一次软更新critic target value网络
 
     exp_name: Optional[str] = None
     """the name of this experiment"""
@@ -99,7 +103,7 @@ class Args:
     """Toggle learning rate annealing for policy and value networks"""
     gamma: float = 0.99
     """the discount factor gamma"""
-    gae_lambda: float = 0.8
+    gae_lambda: float = 0.9
     """the lambda for the general advantage estimation"""
     num_minibatches: int = 16
     """the number of mini-batches"""
@@ -109,13 +113,13 @@ class Args:
     """Toggles advantages normalization"""
     clip_coef: float = 0.2
     """the surrogate clipping coefficient"""
-    clip_vloss: bool = False
+    clip_vloss: bool = True
     """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
     ent_coef: float = 0.05
     """coefficient of the entropy"""
     vf_coef: float = 0.7
     """coefficient of the value function"""
-    max_grad_norm: float = 100.0
+    max_grad_norm: float = 1.0
     """the maximum norm for the gradient clipping"""
     target_kl: float = 0.3
     """the target KL divergence threshold"""
@@ -200,6 +204,9 @@ class Agent(nn.Module):
             nn.ReLU(inplace=True),
             layer_init(nn.Linear(512, 1)),
         )
+        self.critic_target = copy.deepcopy(self.critic).eval()
+        freeze_model(self.critic_target)
+
         instruction = "a red cube and a green cube"
         action_dim = int(np.prod(envs.unwrapped.single_action_space.shape))
         self.actor_mean = CLIPActionHead(instruction, action_dim, sample_obs, use_state=True)
@@ -253,6 +260,18 @@ class Agent(nn.Module):
         x = self.critic_feature_net(x)
         value = self.critic(x)
         return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), value
+
+    # target value 的前向
+    @torch.no_grad()
+    def get_target_value(self, x):
+        xf = self.critic_feature_net(x)               # 不回传梯度
+        v = self.critic_target(xf)
+        return v
+    # 软更新target value网络
+    @torch.no_grad()
+    def update_target(self, tau=0.01):
+        for p, pt in zip(self.critic.parameters(), self.critic_target.parameters()):
+            pt.data.mul_(1 - tau).add_(tau * p.data)
 
 class Logger:
     def __init__(self, log_wandb=False, tensorboard: SummaryWriter = None) -> None:
@@ -442,6 +461,7 @@ if __name__ == "__main__":
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    values_critic_target = torch.zeros((args.num_steps, args.num_envs), device=device)
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
@@ -550,6 +570,7 @@ if __name__ == "__main__":
             with torch.no_grad():
                 action, logprob, _, value = agent.get_action_and_value(next_obs)
                 values[step] = value.flatten()
+                values_critic_target[step] = agent.get_target_value(next_obs).flatten()   # value for critic target
             actions[step] = action
             logprobs[step] = logprob
 
@@ -557,7 +578,7 @@ if __name__ == "__main__":
             next_obs, reward, terminations, truncations, infos = envs.step(action)
             next_done = torch.logical_or(terminations, truncations).to(torch.float32)
             rewards[step] = reward.view(-1) * args.reward_scale
-            # rewards[step] = _utils.reward_scaling(reward.view(-1), done_mask=next_done)           # ★ 正确调用            print(f"Step {step+1}/{args.num_steps} R mean: {reward.mean().item():.3f} std: {reward.std().item():.3f}")
+            # rewards[step] = _utils.reward_scaling(reward.view(-1), done_mask=next_done)           # 正确调用            print(f"Step {step+1}/{args.num_steps} R mean: {reward.mean().item():.3f} std: {reward.std().item():.3f}")
 
             if "final_info" in infos:
                 final_info = infos["final_info"]
@@ -568,13 +589,15 @@ if __name__ == "__main__":
                 for k in infos["final_observation"]:
                     infos["final_observation"][k] = infos["final_observation"][k][done_mask]
                 with torch.no_grad():
-                    final_values[step, torch.arange(args.num_envs, device=device)[done_mask]] = agent.get_value(infos["final_observation"]).view(-1)
-
+                    # final_values[step, torch.arange(args.num_envs, device=device)[done_mask]] = agent.get_value(infos["final_observation"]).view(-1)
+                    final_values[step, torch.arange(args.num_envs, device=device)[done_mask]] = \
+                    agent.get_target_value(infos["final_observation"]).view(-1)   # 用 values for critic target替换原values
         rollout_time = time.perf_counter() - rollout_time
         cumulative_times["rollout_time"] += rollout_time
         # bootstrap value according to termination and truncation
         with torch.no_grad():
-            next_value = agent.get_value(next_obs).reshape(1, -1)
+            # next_value = agent.get_value(next_obs).reshape(1, -1)
+            next_value = agent.get_target_value(next_obs).reshape(1, -1)  # 用 value for critic target替换原value
             advantages = torch.zeros_like(rewards).to(device)
             lastgaelam = 0
             for t in reversed(range(args.num_steps)):
@@ -583,7 +606,8 @@ if __name__ == "__main__":
                     nextvalues = next_value
                 else:
                     next_not_done = 1.0 - dones[t + 1]
-                    nextvalues = values[t + 1]
+                    # nextvalues = values[t + 1]
+                    nextvalues = values_critic_target[t + 1]   # 用 values for critic target 替换原values
                 real_next_values = next_not_done * nextvalues + final_values[t] # t instead of t+1
                 # next_not_done means nextvalues is computed from the correct next_obs
                 # if next_not_done is 1, final_values is always 0
@@ -609,12 +633,12 @@ if __name__ == "__main__":
                     reward_term_sum = args.gae_lambda * args.gamma * reward_term_sum + lam_coef_sum * rewards[t]
                     value_term_sum = args.gae_lambda * args.gamma * value_term_sum + args.gamma * real_next_values
 
-                    advantages[t] = (reward_term_sum + value_term_sum) / lam_coef_sum - values[t]
+                    advantages[t] = (reward_term_sum + value_term_sum) / lam_coef_sum - values[t]   # 注意这里 values[t] 仍是当前 critic
                 else:
-                    delta = rewards[t] + args.gamma * real_next_values - values[t]
+                    delta = rewards[t] + args.gamma * real_next_values - values[t]  # 注意这里 values[t] 仍是当前 critic
                     advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * next_not_done * lastgaelam # Here actually we should use next_not_terminated, but we don't have lastgamlam if terminated
             # advantages = _utils.normalize_advantages(advantages)
-            returns = advantages + values
+            returns = advantages + values   # 仍然让当前 critic 去拟合 returns
 
         # flatten the batch
         b_obs = obs.reshape((-1,))
@@ -682,6 +706,9 @@ if __name__ == "__main__":
 
             if args.target_kl is not None and approx_kl > args.target_kl:
                 break
+        # 软更新 target value 网络
+        if (iteration % args.target_value_interval) == 0:
+            agent.update_target(tau=args.target_value_tau)
         update_time = time.perf_counter() - update_time
         cumulative_times["update_time"] += update_time
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
@@ -706,7 +733,12 @@ if __name__ == "__main__":
         for k, v in cumulative_times.items():
             logger.add_scalar(f"time/total_{k}", v, global_step)
         logger.add_scalar("time/total_rollout+update_time", cumulative_times["rollout_time"] + cumulative_times["update_time"], global_step)
-
+        if logger is not None:
+            logger.add_scalar("critic/value_mean_rollout", values.mean().item(), global_step)
+            logger.add_scalar("critic/value_std_rollout",  values.std().item(),  global_step)
+            logger.add_scalar("critic/critic_target_value_mean_rollout", values_critic_target.mean().item(), global_step)
+            logger.add_scalar("critic/critic_target_value_std_rollout",  values_critic_target.std().item(),  global_step)
+            logger.add_scalar("critic/value_target_gap_L1", (values - values_critic_target).abs().mean().item(), global_step)
     if args.save_model and not args.evaluate:
         model_path = f"runs/{run_name}/final_ckpt.pt"
         torch.save(agent.state_dict(), model_path)

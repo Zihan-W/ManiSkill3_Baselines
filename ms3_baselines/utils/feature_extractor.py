@@ -105,7 +105,7 @@ class FeatureExtractor(nn.Module):
                 freeze_model(backbone)
 
             elif args.vision_type == "hil_serl_resnet":
-                from utils.resnet_v1 import resnetv1_configs, PreTrainedResNetEncoder
+                from ms3_baselines.utils.resnet_v1 import resnetv1_configs, PreTrainedResNetEncoder
                 image_size = (sample_obs["rgb"].shape[1], sample_obs["rgb"].shape[2])
                 pretrained_encoder = resnetv1_configs["resnetv1-10-frozen"](image_size=image_size)
                 freeze_model(pretrained_encoder)
