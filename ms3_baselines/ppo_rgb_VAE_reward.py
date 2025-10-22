@@ -22,21 +22,11 @@ from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper, Flatten
 from mani_skill.utils.wrappers.record import RecordEpisode
 from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 
-# 从/home/wzh-2004/RewardModelTest/VAE/VAE.py加载
-import sys
-sys.path.append("/home/wzh-2004/RewardModelTest/VAE")
-from VAE import VAE, VAEManifoldScorer
-
+from VAE.VAE_reward import load_VAE_reward_model
 @dataclass
 class Args:
 
-    vae_ckpt: Optional[str] = "/home/wzh-2004/RewardModelTest/VAE/ckpt_20251015_110910"
-    vae_reward_coef: float = 1   # λ, 与环境奖励加权
-    vae_sigma: float = 0.5         # 高斯核宽度，越小越“尖锐”
-    vae_k: int = 8                 # 采样K个z近似最短流形距离
-    vae_img_size: int = 96         # 训练VAE时的输入尺寸, 用于resize
-    vae_action_scale: float = 1.0  # 如VAE训练时把动作缩放到[-1,1]，这里也保持一致
-
+    vae_reward_coef: float = 0.2
 
     exp_name: Optional[str] = None
     """the name of this experiment"""
@@ -71,19 +61,19 @@ class Args:
     """the id of the environment"""
     include_state: bool = True
     """whether to include state information in observations"""
-    total_timesteps: int = 20000000
+    total_timesteps: int = 30000000
     """total timesteps of the experiments"""
     learning_rate: float = 3e-4
     """the learning rate of the optimizer"""
-    num_envs: int = 265
+    num_envs: int = 128
     """the number of parallel environments"""
-    num_eval_envs: int = 80
+    num_eval_envs: int = 10
     """the number of parallel evaluation environments"""
     partial_reset: bool = True
     """whether to let parallel environments reset upon termination instead of truncation"""
     eval_partial_reset: bool = False
     """whether to let parallel evaluation environments reset upon termination instead of truncation"""
-    num_steps: int = 16
+    num_steps: int = 50
     """the number of steps to run in each environment per policy rollout"""
     num_eval_steps: int = 50
     """the number of steps to run in each evaluation environment during evaluation"""
@@ -319,8 +309,8 @@ if __name__ == "__main__":
 
     # env setup
     # env_kwargs = dict(obs_mode="rgb", render_mode=args.render_mode, sim_backend="physx_cuda")
-    train_env_kwargs = dict(obs_mode="rgb", render_mode="none", sim_backend="physx_cuda")
-    eval_env_kwargs  = dict(obs_mode="rgb", render_mode=args.render_mode, sim_backend="physx_cuda")
+    train_env_kwargs = dict(obs_mode="rgb", render_mode="none", sim_backend="physx_cuda", reward_mode="sparse")
+    eval_env_kwargs  = dict(obs_mode="rgb", render_mode=args.render_mode, sim_backend="physx_cuda", reward_mode="sparse")
 
     if args.control_mode is not None:
         # env_kwargs["control_mode"] = args.control_mode
@@ -353,43 +343,6 @@ if __name__ == "__main__":
     max_episode_steps = gym_utils.find_max_episode_steps_value(envs._env)
     logger = None
 
-    #####
-    @torch.no_grad()
-    def _vae_debug_once(vae, vae_scorer, obs_rgb, actions, device, sigma_boost_if_tiny=True,
-                        target_r_mean=0.2, max_tries=4):
-        """
-        计算一次 d_rec / r 的统计信息；如 r_mean 极小，逐步把 sigma *= 3 做在线放大。
-        返回 (d_rec, r_cur, sigma_now) 供记录。
-        """
-        s_img = vae_scorer._preprocess_obs(obs_rgb.to(device))
-        a_std = (actions.to(device) - vae_scorer.act_mu) / vae_scorer.act_std
-
-        mu, logvar, s_feat = vae.encode(s_img, a_std)
-        recon = vae.decode(s_feat, mu)
-        d_rec = ((recon - a_std) ** 2).mean(dim=1)  # (B,)
-
-        def r_from_sigma(sig):
-            sig = float(sig)
-            sig = max(sig, 1e-12)
-            return torch.exp(- d_rec / (sig ** 2))
-
-        r_cur = r_from_sigma(vae_scorer.sigma)
-        print(f"[VAE DEBUG] sigma={float(vae_scorer.sigma):.6g} | "
-            f"d_rec mean/med/max={d_rec.mean().item():.4e}/"
-            f"{d_rec.median().item():.4e}/{d_rec.max().item():.4e} | "
-            f"r mean/med/min={r_cur.mean().item():.4f}/"
-            f"{r_cur.median().item():.4f}/{r_cur.min().item():.4f}")
-
-        tries = 0
-        if sigma_boost_if_tiny:
-            while r_cur.mean().item() < target_r_mean and tries < max_tries:
-                vae_scorer.sigma *= 3.0
-                r_cur = r_from_sigma(vae_scorer.sigma)
-                tries += 1
-                print(f"[VAE AUTO-SIGMA] trial#{tries}: sigma->{float(vae_scorer.sigma):.6g}, "
-                    f"r_mean={r_cur.mean().item():.4f}")
-        return d_rec, r_cur, float(vae_scorer.sigma)
-
     if not args.evaluate:
         print("Running training")
         #if args.track:
@@ -398,8 +351,8 @@ if __name__ == "__main__":
             config = vars(args)
             # normalized_dense
             # sparse
-            config["env_cfg"] = dict(**train_env_kwargs, num_envs=args.num_envs, env_id=args.env_id, reward_mode="normalized_dense", env_horizon=max_episode_steps, partial_reset=args.partial_reset)
-            config["eval_env_cfg"] = dict(**eval_env_kwargs, num_envs=args.num_eval_envs, env_id=args.env_id, reward_mode="normalized_dense", env_horizon=max_episode_steps, partial_reset=args.partial_reset)
+            config["env_cfg"] = dict(**train_env_kwargs, num_envs=args.num_envs, env_id=args.env_id, env_horizon=max_episode_steps, partial_reset=args.partial_reset)
+            config["eval_env_cfg"] = dict(**eval_env_kwargs, num_envs=args.num_eval_envs, env_id=args.env_id, env_horizon=max_episode_steps, partial_reset=args.partial_reset)
             print("TRACKING HERE")
             wandb.init(
                 project=args.wandb_project_name,
@@ -446,32 +399,9 @@ if __name__ == "__main__":
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # === 加载已训练的 VAE，用于奖励 ===
-    vae_scorer = None
-    vae_ckpt_path = f"{args.vae_ckpt}/vae_best.pt"
-    if args.vae_ckpt is not None and os.path.isfile(vae_ckpt_path):
-        # 推断通道数与动作维
-        sample_rgb = next_obs["rgb"]  # (N,H,W,C)
-        in_ch = sample_rgb.shape[-1]  # 若你训练时是两路相机拼接到C维，这里就等于 6；单路就是 3
-        action_dim = int(np.prod(envs.single_action_space.shape))
-
-        vae = VAE(in_ch=in_ch, action_dim=action_dim, latent_dim=32, max_action=1.0, feat_dim=256).to(device)
-        vae.load_state_dict(torch.load(vae_ckpt_path, map_location=device))
-        vae_scorer = VAEManifoldScorer(
-            vae=vae, device=device, k=args.vae_k,
-            img_size=args.vae_img_size, ckpt_dir=args.vae_ckpt,
-        )
-        print(f"[VAE] loaded from {args.vae_ckpt}, in_ch={in_ch}, action_dim={action_dim}, sigma={vae_scorer.sigma}")
-        # === DEBUG BLOCK 1: VAE 元数据 ===
-        try:
-            print(f"[VAE] act_mu shape={tuple(vae_scorer.act_mu.shape)}, "
-                f"act_std shape={tuple(vae_scorer.act_std.shape)}, "
-                f"std min/mean/max={vae_scorer.act_std.min().item():.3e}/"
-                f"{vae_scorer.act_std.mean().item():.3e}/{vae_scorer.act_std.max().item():.3e}")
-            print(f"[VAE] sigma(initial) = {float(vae_scorer.sigma):.6g}, k = {vae_scorer.k}, img_size = {vae_scorer.img_size}")
-        except Exception as e:
-            print("[VAE DEBUG] failed to print VAE meta:", repr(e))
-    else:
-        print("[VAE] no vae_ckpt provided or file not found; skip VAE reward.")
+    _img = next_obs["rgb"][0].permute(2,0,1).to(device)
+    _act = actions[0][0].to(device)
+    vae = load_VAE_reward_model(_img, _act, None, device=device)
 
     if args.checkpoint:
         agent.load_state_dict(torch.load(args.checkpoint))
@@ -479,12 +409,6 @@ if __name__ == "__main__":
     cumulative_times = defaultdict(float)
 
     for iteration in range(1, args.num_iterations + 1):
-        # === DEBUG BLOCK 4: 观测图像尺寸/通道 ===
-        if global_step == args.num_envs:
-            rgb = obs[step]["rgb"]
-            print(f"[VAE DEBUG] obs['rgb'] shape={tuple(rgb.shape)} "
-                f"(expect (B,H,W,3) and will be resized to {vae_scorer.img_size}x{vae_scorer.img_size})")
-
         print(f"Epoch: {iteration}, global_step={global_step}")
         final_values = torch.zeros((args.num_steps, args.num_envs), device=device)
         agent.eval()
@@ -555,93 +479,22 @@ if __name__ == "__main__":
             next_obs = {k: v.to(device, non_blocking=True) for k, v in next_obs.items()}
 
             next_done = torch.logical_or(terminations, truncations).to(torch.float32)
-            # rewards[step] = reward.view(-1) * args.reward_scale
+            rewards[step] = reward.view(-1) * args.reward_scale
 
             # === VAE 流形奖励：用 obs[step] 和 actions[step]（即 (s_t, a_t)）===
-            # === DEBUG BLOCK 2: 前几步做一次分布/自适应 ===
-            if vae_scorer is not None and global_step < args.num_envs * 4:
-                d_dbg, r_dbg, sigma_now = _vae_debug_once(
-                    vae=vae, vae_scorer=vae_scorer,
-                    obs_rgb=obs[step]["rgb"], actions=actions[step],
-                    device=device, sigma_boost_if_tiny=True,  # 若 r 很小会自动放大 sigma
-                    target_r_mean=0.2, max_tries=4
-                )
-                if logger is not None:
-                    logger.add_scalar("debug/d_rec_mean", d_dbg.mean().item(), global_step)
-                    logger.add_scalar("debug/d_rec_median", d_dbg.median().item(), global_step)
-                    logger.add_scalar("debug/sigma_now", sigma_now, global_step)
-                    logger.add_scalar("debug/r_dbg_mean", r_dbg.mean().item(), global_step)
+            _imgs = obs[step]["rgb"]
+            _acts = actions[step]
+            vae_rewards = vae.compute_reward(_imgs, _acts)
+            vae_rewards = torch.tensor(vae_rewards).to(device)
 
-            # === DEBUG BLOCK 3: 动作分布与标准化基准的对齐性 ===
-            if vae_scorer is not None and (global_step % (args.num_envs * 32) == 0):
-                a_cur = actions[step].detach()
-                a_mean = a_cur.mean(dim=0)
-                a_std  = a_cur.std(dim=0).clamp_min(1e-12)
-                ref_mu  = vae_scorer.act_mu.squeeze(0).detach().cpu()
-                ref_std = vae_scorer.act_std.squeeze(0).detach().cpu()
-                # 量一个粗略的 mismatch（越小越好；>10 表明维度/尺度可能错）
-                mismatch = torch.mean(torch.abs((a_mean.cpu() - ref_mu) / (ref_std + 1e-12))).item()
-                print(f"[VAE DEBUG] action mean/std vs ref std | mismatch={mismatch:.3f} "
-                    f"(>10 often means control_mode/scale mismatch)")
-                if logger is not None:
-                    logger.add_scalar("debug/action_mean_std_mismatch", mismatch, global_step)
-
-            # === VAE 流形奖励（VAE 训练在“绝对 q”，而 PPO 输出“Δq”时的转换）===
-            if vae_scorer is not None:
-                with torch.no_grad():
-                    # 0) 取出 PPO 的动作（Δq），以及 env 的动作界
-                    a_delta = actions[step]  # (B, A) 这里是 Δq
-                    act_low  = torch.as_tensor(envs.single_action_space.low,  device=device, dtype=a_delta.dtype)
-                    act_high = torch.as_tensor(envs.single_action_space.high, device=device, dtype=a_delta.dtype)
-                    a_delta_clip = torch.max(torch.min(a_delta, act_high), act_low)
-
-                    # 1) 从 obs['state'] 取当前 qpos（假定前 action_dim 就是 qpos；如不是，请调整切片）
-                    action_dim = a_delta.shape[-1]
-                    assert "state" in obs[step], "需要 obs['state'] 来做 Δq -> 绝对 q 的转换"
-                    qpos_cur = obs[step]["state"][..., :action_dim]  # (B, A)
-
-                    # 2) 组装“绝对 q”作为 VAE 的 action
-                    a_abs = qpos_cur + a_delta_clip
-
-                    # 3) 可选：按你 VAE 数据集的绝对关节界做裁剪（如果你有绝对 q 的物理上下界）
-                    # 若没有绝对界，通常不强制裁剪也行，因为标准化会把它带回训练分布；保留注释作为提示。
-                    # joint_low_abs, joint_high_abs = <加载/写死你的绝对关节上下界张量，shape=(A,)>
-                    # a_abs = torch.max(torch.min(a_abs, joint_high_abs), joint_low_abs)
-
-                    # 4) 奖励：用“绝对 q”的动作打分（与训练时一致）
-                    r_mani_abs = vae_scorer.reward(obs[step], a_abs)
-
-                    # 5) 诊断：看看如果误用 Δq 去打分，r 有多差（只记录不参与训练）
-                    r_mani_delta = vae_scorer.reward(obs[step], a_delta_clip)
-
-                    # 6) 选择用于训练的奖励（这里用“绝对 q”的 r”）
-                    r_mani = r_mani_abs
-
-                    # 7) 调试日志（前几步打印，持续写入 TB/W&B）
-                    #   统计 Δq 超界比例（提示策略是否经常超出 env 的 delta 界）
-                    over_low  = (a_delta < act_low).float()
-                    over_high = (a_delta > act_high).float()
-                    frac_oob  = (over_low + over_high).mean().item()
-                    max_viol  = torch.max(torch.max((act_low - a_delta).clamp_min(0.0).abs()),
-                                        torch.max((a_delta - act_high).clamp_min(0.0).abs())).item()
-
-                    if logger is not None:
-                        logger.add_scalar("debug/frac_action_oob_delta", frac_oob, global_step)
-                        logger.add_scalar("debug/r_mani_abs_mean",   r_mani_abs.mean().item(),   global_step)
-                        logger.add_scalar("debug/r_mani_delta_mean", r_mani_delta.mean().item(), global_step)
-
-                    if global_step < args.num_envs * 8:
-                        print(f"[DELTA->ABS DEBUG] oob_frac(delta)={frac_oob:.3f}, max_violation(delta)={max_viol:.3f} | "
-                            f"r_abs_mean={r_mani_abs.mean().item():.4f}, r_delta_mean={r_mani_delta.mean().item():.4f}")
-            else:
-                r_mani = 0.0
+            _env_reward = reward.clone().float()
 
             if logger is not None:
-                logger.add_scalar("debug/reward", reward.mean().item(), global_step)
-                logger.add_scalar("debug/r_mani", args.vae_reward_coef * r_mani.mean().item(), global_step)
+                logger.add_scalar("debug/env_reward", _env_reward.mean().item(), global_step)
+                logger.add_scalar("debug/vae_reward", args.vae_reward_coef * vae_rewards.mean().item(), global_step)
             # 合并奖励
-            reward = torch.zeros_like(reward)
-            rewards[step] = (reward.view(-1) + args.vae_reward_coef * r_mani) * args.reward_scale
+            # reward = torch.zeros_like(reward)
+            rewards[step] = (reward.view(-1) + args.vae_reward_coef * vae_rewards) * args.reward_scale
 
             if "final_info" in infos:
                 final_info = infos["final_info"]
@@ -788,8 +641,6 @@ if __name__ == "__main__":
         for k, v in cumulative_times.items():
             logger.add_scalar(f"time/total_{k}", v, global_step)
         logger.add_scalar("time/total_rollout+update_time", cumulative_times["rollout_time"] + cumulative_times["update_time"], global_step)
-
-        logger.add_scalar("debug/vae_reward", r_mani.mean().item(), global_step)
 
     if args.save_model and not args.evaluate:
         model_path = f"runs/{run_name}/final_ckpt.pt"
