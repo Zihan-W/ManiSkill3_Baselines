@@ -54,9 +54,17 @@ class H5TrajectoryDataset(Dataset):
             for k in all_keys:
                 grp = f[k]
                 base = grp["obs/sensor_data/base_camera/rgb"]  # (T,H,W,C)
-                hand = grp["obs/sensor_data/hand_camera/rgb"]  # (T,H,W,C)
+                if "obs/sensor_data/hand_camera/rgb" in grp:
+                    hand = grp["obs/sensor_data/hand_camera/rgb"]  # (T,H,W,C)
+                    has_hand = True
+                else:
+                    hand = None
+                    has_hand = False
                 acts = grp["actions"]                           # (T,A)
-                T = min(len(base), len(hand), len(acts))
+                if has_hand:
+                    T = min(len(base), len(hand), len(acts))
+                else:
+                    T = min(len(base), len(acts))
                 self.traj_lengths[k] = T
 
                 if self.mode == "single":
@@ -80,15 +88,23 @@ class H5TrajectoryDataset(Dataset):
             self._h5 = h5py.File(self.h5_path, "r")
 
     def _load_one(self, traj_key: str, t: int):
-        """读取单步 (img_t, act_t)"""
+        """读取单步 (img_t, act_t)，兼容没有 hand_camera 的情况"""
         traj = self._h5[traj_key]
         base = traj["obs/sensor_data/base_camera/rgb"][t]   # (H,W,C) uint8
-        hand = traj["obs/sensor_data/hand_camera/rgb"][t]   # (H,W,C) uint8
+        if "obs/sensor_data/hand_camera/rgb" in traj:
+            hand = traj["obs/sensor_data/hand_camera/rgb"][t]   # (H,W,C) uint8
+            has_hand = True
+        else:
+            hand = None
+            has_hand = False
         a    = traj["actions"][t]                           # (A,)
 
         base = torch.from_numpy(base).permute(2,0,1).float() / 255.0  # (C,H,W)
-        hand = torch.from_numpy(hand).permute(2,0,1).float() / 255.0  # (C,H,W)
-        img  = torch.cat([base, hand], dim=0)                         # (2C,H,W)
+        if has_hand:
+            hand = torch.from_numpy(hand).permute(2,0,1).float() / 255.0  # (C,H,W)
+            img  = torch.cat([base, hand], dim=0)                         # (2C,H,W)
+        else:
+            img = base  # (C,H,W)
 
         if self.img_size is not None:
             # resize 到 (img_size,img_size)
@@ -379,7 +395,12 @@ def evaluate(feature_net, vae, val_loader, act_mean, act_std, device):
     return rec_total / max(1, n_batch), kl_total / max(1, n_batch), dir_total / max(1, n_batch), conf_total / max(1, n_batch)
 
 if __name__ == "__main__":
-    h5_path = "/home/wzh-2004/RewardModelTest/Maniskill3_Baseline/demos/StackCube-v1/motionplanning/trajectory.rgb.pd_joint_delta_pos.physx_cpu.h5"
+    # StackCube-v1
+    # h5_path = "/home/wzh-2004/RewardModelTest/Maniskill3_Baseline/demos/StackCube-v1/motionplanning/trajectory.rgb.pd_joint_delta_pos.physx_cpu.h5"
+
+    # PushCube-v1
+    h5_path = "/home/wzh-2004/RewardModelTest/Maniskill3_Baseline/demos/PushCube-v1/motionplanning/trajectory.rgb.pd_joint_delta_pos.physx_cpu.h5"
+
     base_ckpt_dir = os.path.join(os.path.dirname(__file__), "ckpt_VAE")
     stats_path = base_ckpt_dir
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -420,19 +441,33 @@ if __name__ == "__main__":
     # 设置优化器
     params = list(feature_net.parameters()) + list(vae.parameters())
     optim = torch.optim.Adam(params, lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optim, mode='min', factor=0.5, patience=5, min_lr=1e-6
+        )
 
     # 循环训练
     epochs = 100
     running = 0.0
     best_val = float("inf")
-    λ_dir = 0.1
-    λ_conf = 0.1
+    λ_dir = 1.0
+    λ_conf = 1.0
 
     for epoch in range(epochs):
         print(f"Starting Training Epoch {epoch+1}/{epochs}:")
         feature_net.train()
         vae.train()
         running = 0.0
+
+        # 降低lambda_conf的权重，逐步让模型专注于重构和方向一致性
+        if epoch >= epochs // 2:
+            for p in vae.conf_head.parameters():
+                p.requires_grad_(False)
+            λ_conf = 0.0  # 训练损失里去掉，验证仍可观察
+        elif epoch >= epochs // 4:
+            λ_conf = 0.01
+        elif epoch >= epochs // 8:
+            λ_conf = 0.1
+
         for img_batch, action_batch in train_dl:
             img_batch = img_batch.to(device)       # (B, 2C, H, W)
             action_batch = action_batch.to(device) # (B, A)
@@ -478,14 +513,21 @@ if __name__ == "__main__":
 
         train_loss = running / max(1, len(train_dl))
         val_rec, val_kl, val_dir, val_conf = evaluate(feature_net, vae, val_dl, act_mean_full, act_std_full, device)
-        val_loss = val_rec + val_kl + λ_dir * val_dir + λ_conf * val_conf
+        monitor_val_loss =  val_rec + val_kl + λ_dir * val_dir
+        val_loss = monitor_val_loss + λ_conf * val_conf
         print(f"[epoch {epoch+1}/{epochs}] train_loss={train_loss:.4f} | "
+            f"val_loss={val_loss:.4f} | "
+            f"monitor_val_loss={monitor_val_loss:.4f} | "
             f"val_rec={val_rec:.4f} val_kl={val_kl:.4f} "
             f"val_dir={val_dir:.4f} val_conf={val_conf:.4f}")
 
+        # 调整学习率
+        scheduler.step(monitor_val_loss)
+
         # 保存最好模型
-        if val_loss < best_val - 1e-6:
-            best_val = val_loss
+        min_delta = 1e-4
+        if monitor_val_loss < best_val - min_delta:
+            best_val = monitor_val_loss
             torch.save({
                 "feature_net": feature_net.state_dict(),
                 "vae": vae.state_dict(),

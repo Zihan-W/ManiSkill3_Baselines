@@ -106,24 +106,35 @@ class VAEReward:
 
             # 计算重构奖励
             d = ((recon - action_norm) ** 2).mean(dim=1)  # (B,)
-            recon_reward = -d  # 奖励是重构误差的负值
+            distance_reward = -d  # 奖励是重构误差的负值
 
             # 计算方向奖励（每个样本）
             a_direction = self.vae.dir_head(img)  # (B, A) 动作方向
             a_direction = F.normalize(a_direction, dim=1, eps=1e-8)
             a_unit = F.normalize(action_norm, dim=1, eps=1e-8)
             cos_sim = torch.sum(a_direction * a_unit, dim=1)  # (B,)
-            direction_reward = cos_sim  # (B,) 最大化余弦相似度（使方向一致）
+            forward_reward = cos_sim  # (B,) 最大化余弦相似度（使方向一致）
 
-        # return recon_reward.cpu().numpy(), direction_reward.cpu().numpy()
-        return (recon_reward + direction_reward).cpu().numpy()
+        return distance_reward.cpu().numpy(), forward_reward.cpu().numpy()
+        # return (recon_reward + direction_reward).cpu().numpy()
+
+    def compute_penalty(self, forward_rewards, time_penalty_coef=0.01):
+        time_penalty = - time_penalty_coef * torch.ones_like(forward_rewards)
+        return time_penalty + forward_rewards
 
 def load_VAE_reward_model(img, act, model_path, device):
     # 配置参数
-    dataset_path = "/home/wzh-2004/RewardModelTest/Maniskill3_Baseline/demos/StackCube-v1/motionplanning/trajectory.rgb.pd_joint_delta_pos.physx_cpu.h5"   # 数据集路径
+    # StackCube-v1 motionplanning 数据集
+    # dataset_path = "/home/wzh-2004/RewardModelTest/Maniskill3_Baseline/demos/StackCube-v1/motionplanning/trajectory.rgb.pd_joint_delta_pos.physx_cpu.h5"   # 数据集路径
+    # StackCube-v1 teleop 数据集
     # dataset_path = "/home/wzh-2004/RewardModelTest/Maniskill3_Baseline/demos/StackCube-v1/demos/StackCube-v1/teleop/trajectory.rgb.pd_joint_delta_pos.physx_cpu.h5"   # 数据集路径
-    stats_path   = "/home/wzh-2004/RewardModelTest/VAE/ckpt_VAE"
-    model_path   = "/home/wzh-2004/RewardModelTest/Maniskill3_Baseline/ManiSkill3_Baselines/ms3_baselines/VAE/ckpt_VAE/version1/vae_best.pt" if model_path is None else model_path
+    # StackCube-v1 teleop model权重
+    # model_path   = "/home/wzh-2004/RewardModelTest/Maniskill3_Baseline/ManiSkill3_Baselines/ms3_baselines/VAE/ckpt_VAE/stack_cube_version1/vae_best.pt" if model_path is None else model_path
+
+    # PushCube-v1 motionplanning 数据集
+    dataset_path = "/home/wzh-2004/RewardModelTest/Maniskill3_Baseline/demos/PushCube-v1/motionplanning/trajectory.rgb.pd_joint_delta_pos.physx_cpu.h5"   # 数据集路径
+    model_path = "/home/wzh-2004/RewardModelTest/Maniskill3_Baseline/ManiSkill3_Baselines/ms3_baselines/VAE/ckpt_VAE/push_cube_version2/vae_best.pt"
+
     latent_dim   = 32                          # VAE 潜在空间维度
     max_action   = 1.0                         # 动作最大值 (动作归一化后)
     device       = torch.device("cuda" if torch.cuda.is_available() else "cpu") if device is None else device
@@ -144,7 +155,8 @@ def load_VAE_reward_model(img, act, model_path, device):
 def main():
 
     vae, ds = load_VAE_reward_model(None,None, model_path=None, device=None)
-    # # 在验证集上计算奖励
+
+    # # 如果需要在验证集上计算奖励，取消注释以下代码
     # # 取验证集
     # val_ratio = 0.1  # 10% 做验证
     # N = len(ds)
@@ -168,7 +180,7 @@ def main():
 
 
     # 在单条轨迹上计算奖励
-    traj_id = 10
+    traj_id = 0
     traj_key = f"traj_{traj_id}"
 
     # 找到该 traj 的所有 dataset 索引（按时间顺序）
@@ -207,15 +219,15 @@ def main():
         plt.subplot(2, 1, 1)
         plt.plot(timesteps, recon_rewards, marker='o', linestyle='-', color='b')
         plt.xlabel("Timestep")
-        plt.ylabel("Recon Reward")
-        plt.title(f"Reconstruction Rewards for {traj_key}")
+        plt.ylabel("Distance Reward")
+        plt.title(f"Distance Rewards for {traj_key}")
         plt.grid(True)
 
         plt.subplot(2, 1, 2)
         plt.plot(timesteps, direction_rewards, marker='o', linestyle='-', color='g')
         plt.xlabel("Timestep")
-        plt.ylabel("Direction Reward")
-        plt.title(f"Direction Rewards for {traj_key}")
+        plt.ylabel("Forward Reward")
+        plt.title(f"Forward Rewards for {traj_key}")
         plt.grid(True)
 
         plt.tight_layout()

@@ -27,6 +27,8 @@ from VAE.VAE_reward import load_VAE_reward_model
 class Args:
 
     vae_reward_coef: float = 0.2
+    vae_distance_reward_coef: float = 0.1
+    vae_forward_reward_coef: float = 1.0
 
     exp_name: Optional[str] = None
     """the name of this experiment"""
@@ -57,7 +59,7 @@ class Args:
     """the environment rendering mode"""
 
     # Algorithm specific arguments
-    env_id: str = "StackCube-v1"
+    env_id: str = "PushCube-v1"
     """the id of the environment"""
     include_state: bool = True
     """whether to include state information in observations"""
@@ -65,7 +67,7 @@ class Args:
     """total timesteps of the experiments"""
     learning_rate: float = 3e-4
     """the learning rate of the optimizer"""
-    num_envs: int = 128
+    num_envs: int = 256
     """the number of parallel environments"""
     num_eval_envs: int = 10
     """the number of parallel evaluation environments"""
@@ -109,7 +111,7 @@ class Args:
     """the target KL divergence threshold"""
     reward_scale: float = 1.0
     """Scale the reward by this factor"""
-    eval_freq: int = 100
+    eval_freq: int = 50
     """evaluation frequency in terms of iterations"""
     save_train_video_freq: Optional[int] = None
     """frequency to save training videos in terms of iterations"""
@@ -484,14 +486,22 @@ if __name__ == "__main__":
             # === VAE 流形奖励：用 obs[step] 和 actions[step]（即 (s_t, a_t)）===
             _imgs = obs[step]["rgb"]
             _acts = actions[step]
-            vae_rewards = vae.compute_reward(_imgs, _acts)
-            vae_rewards = torch.tensor(vae_rewards).to(device)
+
+            # 计算奖励
+            distance_rewards, forward_rewards = vae.compute_reward(_imgs, _acts)
+
+            # 计算惩罚
+            time_penalty = vae.compute_penalty(forward_rewards, time_penalty_coef=0.01)
+            vae_rewards = torch.tensor(args.vae_distance_reward_coef * distance_rewards + args.vae_forward_reward_coef * forward_rewards).to(device)
 
             _env_reward = reward.clone().float()
 
             if logger is not None:
                 logger.add_scalar("debug/env_reward", _env_reward.mean().item(), global_step)
-                logger.add_scalar("debug/vae_reward", args.vae_reward_coef * vae_rewards.mean().item(), global_step)
+                logger.add_scalar("debug/scaled_vae_reward", args.vae_reward_coef * vae_rewards.mean().item(), global_step)
+                logger.add_scalar("debug/original_vae_reward", vae_rewards.mean().item(), global_step)
+                logger.add_scalar("debug/original_distance_rewards", distance_rewards.mean().item(), global_step)
+                logger.add_scalar("debug/original_forward_rewards", forward_rewards.mean().item(), global_step)
             # 合并奖励
             # reward = torch.zeros_like(reward)
             rewards[step] = (reward.view(-1) + args.vae_reward_coef * vae_rewards) * args.reward_scale
