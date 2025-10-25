@@ -403,7 +403,8 @@ if __name__ == "__main__":
     # === 加载已训练的 VAE，用于奖励 ===
     _img = next_obs["rgb"][0].permute(2,0,1).to(device)
     _act = actions[0][0].to(device)
-    vae = load_VAE_reward_model(_img, _act, None, device=device)
+    _prop = next_obs["state"][0][:7].to(device)
+    vae = load_VAE_reward_model(_img, _act, _prop, model_path=None, device=device)
 
     if args.checkpoint:
         agent.load_state_dict(torch.load(args.checkpoint))
@@ -486,13 +487,15 @@ if __name__ == "__main__":
             # === VAE 流形奖励：用 obs[step] 和 actions[step]（即 (s_t, a_t)）===
             _imgs = obs[step]["rgb"]
             _acts = actions[step]
+            _prop = next_obs["state"][:, :7]
 
             # 计算奖励
-            distance_rewards, forward_rewards = vae.compute_reward(_imgs, _acts)
+            distance_rewards, direction_rewards = vae.compute_reward(_imgs, _acts, _prop)
 
             # 计算惩罚
-            time_penalty = vae.compute_penalty(forward_rewards, time_penalty_coef=0.01)
-            vae_rewards = torch.tensor(args.vae_distance_reward_coef * distance_rewards + args.vae_forward_reward_coef * forward_rewards).to(device)
+            # time_penalty = vae.compute_penalty(direction_rewards, time_penalty_coef=0.01)
+
+            vae_rewards = torch.tensor(args.vae_distance_reward_coef * distance_rewards + args.vae_forward_reward_coef * direction_rewards).to(device)
 
             _env_reward = reward.clone().float()
 
@@ -501,7 +504,7 @@ if __name__ == "__main__":
                 logger.add_scalar("debug/scaled_vae_reward", args.vae_reward_coef * vae_rewards.mean().item(), global_step)
                 logger.add_scalar("debug/original_vae_reward", vae_rewards.mean().item(), global_step)
                 logger.add_scalar("debug/original_distance_rewards", distance_rewards.mean().item(), global_step)
-                logger.add_scalar("debug/original_forward_rewards", forward_rewards.mean().item(), global_step)
+                logger.add_scalar("debug/original_forward_rewards", direction_rewards.mean().item(), global_step)
             # 合并奖励
             # reward = torch.zeros_like(reward)
             rewards[step] = (reward.view(-1) + args.vae_reward_coef * vae_rewards) * args.reward_scale

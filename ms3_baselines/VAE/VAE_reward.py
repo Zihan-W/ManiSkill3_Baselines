@@ -6,20 +6,21 @@ import torch.nn.functional as F
 
 try:
     from .VAE import VAE
-    from .VAE import SmallCNN
+    from .VAE import FeatureExtractor
     from .VAE import make_loader
 except ImportError:
     from VAE import VAE
-    from VAE import SmallCNN
+    from VAE import FeatureExtractor
     from VAE import make_loader
 
 class VAEReward:
-    def __init__(self, img, act, latent_dim, max_action, model_path, device):
+    def __init__(self, img, act, prop, latent_dim, max_action, model_path, device):
         self.device = device
 
-        self.feature_net = SmallCNN(in_ch=img.shape[0], feat_dim=256).to(device)
+        self.feature_net = FeatureExtractor(img, prop).to(device)
         self.state_dim = self.feature_net.feat_dim
         self.action_dim = act.shape[0]
+        self.prop_dim = self.feature_net.prop_dim
         self.latent_dim = latent_dim
         self.max_action = max_action
 
@@ -48,7 +49,7 @@ class VAEReward:
         self.feature_net.eval()
         self.vae.eval()
 
-    def compute_reward(self, img, action):
+    def compute_reward(self, img, action, prop):
         """
         计算 VAE 重构误差作为奖励
         img: (B, 2C, H, W) 或 (B, H, W, 2C) 或 (2C, H, W) 等多种形式，支持 uint8/0-255 或 已归一化 float
@@ -88,8 +89,9 @@ class VAEReward:
                 # 后面会把 img 移到 device
 
             # 移动到设备并通过特征网络
-            img = img.to(self.device)
-            img = self.feature_net(img)  # 提取特征
+            _img = img.to(self.device)
+            _prop = prop.to(self.device)
+            feat = self.feature_net(_img, _prop)  # 提取特征
 
             # --- 处理 action 张量格式 ---
             if not isinstance(action, torch.Tensor):
@@ -100,29 +102,29 @@ class VAEReward:
             action_norm = (action - self.act_mean) / (self.act_std + 1e-12)
 
             # 编码并用后验均值重构
-            z_in = self.vae.encode(img, action_norm)
+            z_in = self.vae.encode(feat, action_norm)
             mu = self.vae.mean(z_in)
-            recon = self.vae.decode(img, mu)
+            recon = self.vae.decode(feat, mu)
 
             # 计算重构奖励
             d = ((recon - action_norm) ** 2).mean(dim=1)  # (B,)
             distance_reward = -d  # 奖励是重构误差的负值
 
             # 计算方向奖励（每个样本）
-            a_direction = self.vae.dir_head(img)  # (B, A) 动作方向
+            a_direction = self.vae.dir_head(feat)  # (B, A) 动作方向
             a_direction = F.normalize(a_direction, dim=1, eps=1e-8)
             a_unit = F.normalize(action_norm, dim=1, eps=1e-8)
             cos_sim = torch.sum(a_direction * a_unit, dim=1)  # (B,)
-            forward_reward = cos_sim  # (B,) 最大化余弦相似度（使方向一致）
+            direction_reward = cos_sim  # (B,) 最大化余弦相似度（使方向一致）
 
-        return distance_reward.cpu().numpy(), forward_reward.cpu().numpy()
+        return distance_reward.cpu().numpy(), direction_reward.cpu().numpy()
         # return (recon_reward + direction_reward).cpu().numpy()
 
-    def compute_penalty(self, forward_rewards, time_penalty_coef=0.01):
-        time_penalty = - time_penalty_coef * torch.ones_like(forward_rewards)
-        return time_penalty + forward_rewards
+    def compute_penalty(self, direction_rewards, time_penalty_coef=0.01):
+        time_penalty = - time_penalty_coef * torch.ones_like(direction_rewards)
+        return time_penalty
 
-def load_VAE_reward_model(img, act, model_path, device):
+def load_VAE_reward_model(img, act, prop, model_path, device):
     # 配置参数
     # StackCube-v1 motionplanning 数据集
     # dataset_path = "/home/wzh-2004/RewardModelTest/Maniskill3_Baseline/demos/StackCube-v1/motionplanning/trajectory.rgb.pd_joint_delta_pos.physx_cpu.h5"   # 数据集路径
@@ -133,28 +135,28 @@ def load_VAE_reward_model(img, act, model_path, device):
 
     # PushCube-v1 motionplanning 数据集
     dataset_path = "/home/wzh-2004/RewardModelTest/Maniskill3_Baseline/demos/PushCube-v1/motionplanning/trajectory.rgb.pd_joint_delta_pos.physx_cpu.h5"   # 数据集路径
-    model_path = "/home/wzh-2004/RewardModelTest/Maniskill3_Baseline/ManiSkill3_Baselines/ms3_baselines/VAE/ckpt_VAE/push_cube_version2/vae_best.pt"
+    model_path = "/home/wzh-2004/RewardModelTest/Maniskill3_Baseline/ManiSkill3_Baselines/ms3_baselines/VAE/ckpt_VAE/push_cube_version5/vae_best.pt"
 
     latent_dim   = 32                          # VAE 潜在空间维度
     max_action   = 1.0                         # 动作最大值 (动作归一化后)
     device       = torch.device("cuda" if torch.cuda.is_available() else "cpu") if device is None else device
     print(f"Using device: {device}")
 
-    if img is None or act is None:
+    if img is None or act is None or prop is None:
         # 创建数据集和数据加载器
         ds, dl  = make_loader(dataset_path)
         # 取出一条样本，用于初始化网络
-        img, act = ds[0]         # 第 0 条样本 (img: (2C,H,W), act: (A,))
+        img, act, prop = ds[0]         # 第 0 条样本 (img: (2C,H,W), act: (A,), prop: (P,))
         # 创建 VAEReward 模型
-        vae_reward = VAEReward(img, act, latent_dim, max_action, model_path, device)
+        vae_reward = VAEReward(img, act, prop, latent_dim, max_action, model_path, device)
         return vae_reward, ds
     else:
-        vae_reward = VAEReward(img, act, latent_dim, max_action, model_path, device)
+        vae_reward = VAEReward(img, act, prop, latent_dim, max_action, model_path, device)
         return vae_reward
 
 def main():
 
-    vae, ds = load_VAE_reward_model(None,None, model_path=None, device=None)
+    vae, ds = load_VAE_reward_model(None, None, None, model_path=None, device=None)
 
     # # 如果需要在验证集上计算奖励，取消注释以下代码
     # # 取验证集
@@ -180,7 +182,7 @@ def main():
 
 
     # 在单条轨迹上计算奖励
-    traj_id = 0
+    traj_id = 99
     traj_key = f"traj_{traj_id}"
 
     # 找到该 traj 的所有 dataset 索引（按时间顺序）
@@ -199,8 +201,9 @@ def main():
         # 从 dataset 读取并堆叠为 batch
         imgs = torch.stack([ds[i][0] for i in batch_idxs], dim=0)   # (B, 2C, H, W)
         acts = torch.stack([ds[i][1] for i in batch_idxs], dim=0)   # (B, A)
+        props = torch.stack([ds[i][2] for i in batch_idxs], dim=0)   # (B, P)
         # 计算 reward（VAEReward.compute_reward 返回 numpy array (B,)）
-        batch_recon_rewards, batch_direction_rewards = vae.compute_reward(imgs, acts)
+        batch_recon_rewards, batch_direction_rewards = vae.compute_reward(imgs, acts, props)
         recon_rewards_list.append(batch_recon_rewards)
         direction_rewards_list.append(batch_direction_rewards)
     print("Recon rewards:", recon_rewards_list)

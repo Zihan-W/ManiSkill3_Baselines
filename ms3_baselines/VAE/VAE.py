@@ -98,6 +98,7 @@ class H5TrajectoryDataset(Dataset):
             hand = None
             has_hand = False
         a    = traj["actions"][t]                           # (A,)
+        proprioceptive = traj["obs/agent/qpos"][t][:-2]  # (P,)
 
         base = torch.from_numpy(base).permute(2,0,1).float() / 255.0  # (C,H,W)
         if has_hand:
@@ -111,19 +112,22 @@ class H5TrajectoryDataset(Dataset):
             img = F.interpolate(img.unsqueeze(0), size=(self.img_size, self.img_size),
                                 mode="bilinear", align_corners=False).squeeze(0)
         act = torch.from_numpy(a).float()                              # (A,)
-        return img, act
+
+        proprioceptive = torch.from_numpy(proprioceptive).float()      # (P,)
+
+        return img, act, proprioceptive
 
     def __getitem__(self, idx: int):
         self._ensure_open()
         traj_key, t = self.indices[idx]
         if self.mode == "single":
-            img, act = self._load_one(traj_key, t)
-            return img, act
+            img, act, prop = self._load_one(traj_key, t)
+            return img, act, prop
         else:
             # pair: (t, t+1) 保证是同一条轨迹
-            img_t,  act_t  = self._load_one(traj_key, t)
-            img_tp1,act_tp1 = self._load_one(traj_key, t+1)
-            return img_t, act_t, img_tp1, act_tp1
+            img_t,  act_t, prop_t = self._load_one(traj_key, t)
+            img_tp1,act_tp1, prop_tp1 = self._load_one(traj_key, t+1)
+            return img_t, act_t, img_tp1, act_tp1, prop_t, prop_tp1
 
     # ======= 一些实用辅助 =======
 
@@ -156,9 +160,9 @@ def make_loader(h5_path: str,
 
 # 实现简单的CNN编码器
 class SmallCNN(nn.Module):
-    def __init__(self, in_ch=6, feat_dim=256):
+    def __init__(self, in_ch=6, img_feat_dim=256):
         super().__init__()
-        self.feat_dim = feat_dim
+        self.img_feat_dim = img_feat_dim
         self.net = nn.Sequential(
             nn.Conv2d(in_ch, 32, 5, stride=2, padding=2), nn.ReLU(inplace=True),
             nn.Conv2d(32, 64, 5, stride=2, padding=2),   nn.ReLU(inplace=True),
@@ -166,11 +170,47 @@ class SmallCNN(nn.Module):
             nn.Conv2d(128, 256, 3, stride=2, padding=1), nn.ReLU(inplace=True),
             nn.AdaptiveAvgPool2d(1),
         )
-        self.fc = nn.Linear(256, feat_dim)
+        self.fc = nn.Linear(256, img_feat_dim)
 
     def forward(self, x):
         x = self.net(x).flatten(1)
         return self.fc(x)
+
+class MLP(nn.Module):
+    def __init__(self, prop_dim, prop_feat_dim, hidden_dims: List[int], activate_final: bool = False):
+        super(MLP, self).__init__()
+        layers = []
+        last_dim = prop_dim
+        for hdim in hidden_dims:
+            layers.append(nn.Linear(last_dim, hdim))
+            layers.append(nn.ReLU(inplace=True))
+            last_dim = hdim
+        layers.append(nn.Linear(last_dim, prop_feat_dim))
+        if activate_final:
+            layers.append(nn.ReLU(inplace=True))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+class FeatureExtractor(nn.Module):
+    def __init__(self, img, prop, hidden_dims: List[int] = [512, 512]):
+        super(FeatureExtractor, self).__init__()
+        in_ch=img.shape[0]
+        img_feat_dim =256
+        self.cnn = SmallCNN(in_ch=in_ch, img_feat_dim=img_feat_dim)
+
+        self.prop_dim = prop.shape[0]
+        prop_feat_dim = 16
+        self.mlp = MLP(self.prop_dim, prop_feat_dim, hidden_dims=hidden_dims)
+
+        self.feat_dim = img_feat_dim + prop_feat_dim
+
+    def forward(self, img_batch, prop_batch):
+        img_feat = self.cnn(img_batch)
+        prop_feat = self.mlp(prop_batch)
+        feat = torch.cat([img_feat, prop_feat], dim=1)
+        return feat
 
 # Vanilla Variational Auto-Encoder
 class VAE(nn.Module):
@@ -209,7 +249,6 @@ class VAE(nn.Module):
             nn.Linear(hidden//2, 1)  # 输出 logit
         )
 
-
     def forward(self, state, action):
         # VAE
         z = self.encode(state, action)
@@ -221,7 +260,6 @@ class VAE(nn.Module):
 
         u = self.decode(state, z)
 
-        recon = self.decode(state, z)
         # 方向头
         a_dir = self.dir_head(state)                       # (B, A)
         a_dir = F.normalize(a_dir, dim=1, eps=1e-8)        # 单位化
@@ -229,7 +267,6 @@ class VAE(nn.Module):
         conf_logit = self.conf_head(torch.cat([state, action], dim=1)).squeeze(1)  # (B,)
 
         return u, mu, std, a_dir, conf_logit
-
 
     def encode(self, state, action):
         z = F.relu(self.e1(torch.cat([state, action], 1)))
@@ -248,77 +285,44 @@ class VAE(nn.Module):
 def compute_action_stats(dataset, batch_size=2048, num_workers=4, pin_memory=True,
                          use_cuda=None, stats_path: str | None = None):
     """
-    - 如果 stats_path 是目录：自动保存为 <stats_path>/action_stats.pt
-    - 如果 stats_path 是文件：直接用该文件名
-    - 若文件已存在则加载返回
+    始终重新计算动作的 mean/std（不做任何文件读写）。
+    参数说明类似之前的实现，但 stats_path 参数会被忽略以保持向后兼容。
+    返回：mean, std（均为 CPU 上的 torch.Tensor）
     """
     if use_cuda is None:
         use_cuda = torch.cuda.is_available()
     device = torch.device("cuda" if use_cuda else "cpu")
 
-    # 规范化保存路径
-    save_path = None
-    if stats_path is not None:
-        if os.path.isdir(stats_path):
-            save_path = os.path.join(stats_path, "action_stats.pt")
-        else:
-            # 既可能是“不存在的文件名”，也可能是“已存在的文件”
-            dirpath = os.path.dirname(stats_path)
-            if dirpath:
-                os.makedirs(dirpath, exist_ok=True)
-            save_path = stats_path
-
-        # 尝试读取缓存
-        if os.path.exists(save_path):
-            try:
-                data = torch.load(save_path, map_location="cpu")
-                if isinstance(data, dict) and "mean" in data and "std" in data:
-                    return data["mean"].float(), data["std"].float()
-                if isinstance(data, (list, tuple)) and len(data) == 2:
-                    return torch.as_tensor(data[0]).float(), torch.as_tensor(data[1]).float()
-            except Exception as e:
-                print(f"[WARN] Failed to load cached stats from {save_path}: {e}")
-
-    # 计算
     tmp_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
                             num_workers=num_workers, pin_memory=pin_memory,
                             persistent_workers=(num_workers > 0))
+
     n = 0
     s1 = None
     s2 = None
     with torch.no_grad():
-        for _, a in tmp_loader:
+        for batch in tmp_loader:
+            # 支持 dataset 返回 (img, act) 或 (img, act, prop) 等多种形式：
+            if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+                a = batch[1]
+            else:
+                a = batch
+
             if use_cuda:
                 a = a.to(device, non_blocking=True)
             a = a.float()
+
             s1 = a.sum(dim=0) if s1 is None else s1 + a.sum(dim=0)
             s2 = (a * a).sum(dim=0) if s2 is None else s2 + (a * a).sum(dim=0)
             n += a.shape[0]
 
-    # compute mean/var on the same device as s1/s2 to avoid mixing CPU/GPU tensors
     if s1 is None:
         raise RuntimeError("No data found in dataset to compute action stats")
+
     mean_dev = s1 / n
     var_dev = s2 / n - mean_dev ** 2
-    # move to CPU for saving/return
     mean = mean_dev.cpu()
-    var = var_dev.cpu()
-    std  = torch.sqrt(var.clamp_min(1e-12))
-
-    # 保存
-    if save_path is not None:
-        try:
-            torch.save({"mean": mean, "std": std}, save_path)
-            print(f"[OK] Saved action stats to {save_path}")
-        except Exception as e:
-            print(f"[WARN] Failed to save stats to {save_path}: {e}")
-
-        # 额外存 .npy 方便别处用
-        try:
-            np.save(os.path.splitext(save_path)[0] + "_mean.npy", mean.numpy())
-            np.save(os.path.splitext(save_path)[0] + "_std.npy",  std.numpy())
-        except Exception as e:
-            print(f"[WARN] Failed to save npy: {e}")
+    std = torch.sqrt(var_dev.clamp_min(1e-12)).cpu()
 
     return mean, std
 
@@ -356,14 +360,15 @@ def split_by_trajectory(ds: H5TrajectoryDataset, val_ratio: float = 0.1, seed: i
 def evaluate(feature_net, vae, val_loader, act_mean, act_std, device):
     feature_net.eval(); vae.eval()
     rec_total, kl_total, dir_total, conf_total, n_batch = 0.0, 0.0, 0.0, 0.0, 0
-    for img_batch, action_batch in val_loader:
+    for img_batch, action_batch, prop_batch in val_loader:
         img_batch = img_batch.to(device)
         action_batch = action_batch.to(device)
+        prop_batch = prop_batch.to(device)
 
-        img_feat = feature_net(img_batch)
+        state_feat = feature_net(img_batch, prop_batch)
         action_norm = (action_batch - act_mean) / act_std
 
-        pred_norm, mu, std, a_direction, conf_logit = vae(img_feat, action_norm)
+        pred_norm, mu, std, a_direction, conf_logit = vae(state_feat, action_norm)
 
         # 重构损失 + KL损失
         rec_loss = F.mse_loss(pred_norm, action_norm)
@@ -381,7 +386,7 @@ def evaluate(feature_net, vae, val_loader, act_mean, act_std, device):
 
         idx_neg = torch.randperm(action_norm.size(0), device=device)
         a_neg = action_norm[idx_neg]
-        conf_neg = vae.conf_head(torch.cat([img_feat, a_neg], dim=1)).squeeze(1)
+        conf_neg = vae.conf_head(torch.cat([state_feat, a_neg], dim=1)).squeeze(1)
         y_neg = torch.zeros_like(conf_neg)
         bce_neg = F.binary_cross_entropy_with_logits(conf_neg, y_neg)
         conf_loss = 0.5 * (bce_pos + bce_neg)
@@ -420,8 +425,8 @@ if __name__ == "__main__":
     val_dl   = DataLoader(val_ds,   batch_size=128, shuffle=False, num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=4)
 
     # 取出一条样本，用于初始化网络
-    img, act = ds[0]          # 第 0 条样本 (img: (2C,H,W), act: (A,))
-    feature_net = SmallCNN(in_ch=img.shape[0], feat_dim=256).to(device)
+    img, act, prop = ds[0]          # 第 0 条样本 (img: (2C,H,W), act: (A,))
+    feature_net = FeatureExtractor(img, prop).to(device)
     state_dim = feature_net.feat_dim
     action_dim = act.shape[0]
     latent_dim = 32
@@ -468,17 +473,17 @@ if __name__ == "__main__":
         elif epoch >= epochs // 8:
             λ_conf = 0.1
 
-        for img_batch, action_batch in train_dl:
+        for img_batch, action_batch, prop_batch in train_dl:
             img_batch = img_batch.to(device)       # (B, 2C, H, W)
             action_batch = action_batch.to(device) # (B, A)
-            # imgs: (B, C, H, W)  acts: (B, A)
-            # print("img_batch.shape, action_batch.shape", img_batch.shape, action_batch.shape)
-            img_feat = feature_net(img_batch)  # (B, state_dim)
+            prop_batch = prop_batch.to(device)     # (B, P)
+
+            state_feat = feature_net(img_batch, prop_batch)  # (B, state_dim=feat_dim)
             # print("img_feat.shape", img_feat.shape)
 
             # 标准化动作
             action_batch_norm = (action_batch - act_mean_full) / act_std_full
-            pred_norm, mu, std, a_direction, conf_logit = vae(img_feat, action_batch_norm)
+            pred_norm, mu, std, a_direction, conf_logit = vae(state_feat, action_batch_norm)
 
             rec_loss = F.mse_loss(pred_norm, action_batch_norm)
             # KL = 0.5 * sum( std^2 + mu^2 - 1 - log(std^2) )
@@ -498,7 +503,7 @@ if __name__ == "__main__":
             # 负样本：同一 batch 打乱动作
             idx_neg = torch.randperm(action_batch_norm.size(0), device=action_batch_norm.device)
             a_neg   = action_batch_norm[idx_neg]
-            conf_neg = vae.conf_head(torch.cat([img_feat, a_neg], dim=1)).squeeze(1)
+            conf_neg = vae.conf_head(torch.cat([state_feat, a_neg], dim=1)).squeeze(1)
             y_neg = torch.zeros_like(conf_neg)
             bce_neg = F.binary_cross_entropy_with_logits(conf_neg, y_neg)
             conf_loss = 0.5 * (bce_pos + bce_neg)
@@ -525,7 +530,7 @@ if __name__ == "__main__":
         scheduler.step(monitor_val_loss)
 
         # 保存最好模型
-        min_delta = 1e-4
+        min_delta = 1e-3
         if monitor_val_loss < best_val - min_delta:
             best_val = monitor_val_loss
             torch.save({
