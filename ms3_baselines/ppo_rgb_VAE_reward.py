@@ -26,9 +26,21 @@ from VAE.VAE_reward import load_VAE_reward_model
 @dataclass
 class Args:
 
-    vae_reward_coef: float = 0.2
+    # ====== VAE shaping reward相关系数 ======
+    vae_reward_coef: float = 1.0
+    """global scale applied to all VAE-style intrinsic rewards"""
+
     vae_distance_reward_coef: float = 0.1
-    vae_forward_reward_coef: float = 1.0
+    """weight on action reconstruction (-MSE) reward"""
+
+    vae_forward_reward_coef: float = 0.1
+    """weight on direction / alignment reward (cos sim)"""
+
+    vae_progress_reward_coef: float = 1.0
+    """weight on progress delta reward φ(s_{t+1})-φ(s_t)"""
+
+    time_penalty_coef: float = 0.01
+    """per-step penalty encouraging faster completion"""
 
     exp_name: Optional[str] = None
     """the name of this experiment"""
@@ -403,7 +415,7 @@ if __name__ == "__main__":
     # === 加载已训练的 VAE，用于奖励 ===
     _img = next_obs["rgb"][0].permute(2,0,1).to(device)
     _act = actions[0][0].to(device)
-    vae = load_VAE_reward_model(_img, _act, None, device=device)
+    vae_reward_model = load_VAE_reward_model(_img, _act, None, device=device)
 
     if args.checkpoint:
         agent.load_state_dict(torch.load(args.checkpoint))
@@ -488,10 +500,10 @@ if __name__ == "__main__":
             _acts = actions[step]
 
             # 计算奖励
-            distance_rewards, forward_rewards = vae.compute_reward(_imgs, _acts)
+            distance_rewards, forward_rewards = vae_reward_model.compute_reward(_imgs, _acts)
 
             # 计算惩罚
-            time_penalty = vae.compute_penalty(forward_rewards, time_penalty_coef=0.01)
+            time_penalty = vae_reward_model.compute_penalty(forward_rewards, time_penalty_coef=0.01)
             vae_rewards = torch.tensor(args.vae_distance_reward_coef * distance_rewards + args.vae_forward_reward_coef * forward_rewards).to(device)
 
             _env_reward = reward.clone().float()

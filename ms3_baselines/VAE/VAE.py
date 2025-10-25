@@ -209,6 +209,16 @@ class VAE(nn.Module):
             nn.Linear(hidden//2, 1)  # 输出 logit
         )
 
+        # ====== 新增 head 3：进展度 Φ(s) ======
+        # 语义：越接近专家演示后期，数值应该越大
+        self.progress_head = nn.Sequential(
+            nn.Linear(state_dim, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, hidden//2),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden//2, 1)  # -> 标量
+        )
+
 
     def forward(self, state, action):
         # VAE
@@ -221,14 +231,17 @@ class VAE(nn.Module):
 
         u = self.decode(state, z)
 
-        recon = self.decode(state, z)
         # 方向头
         a_dir = self.dir_head(state)                       # (B, A)
         a_dir = F.normalize(a_dir, dim=1, eps=1e-8)        # 单位化
+
         # 置信头，判别 (s, a_norm) 是否在流形上
         conf_logit = self.conf_head(torch.cat([state, action], dim=1)).squeeze(1)  # (B,)
 
-        return u, mu, std, a_dir, conf_logit
+        # 进展度头
+        progress_score = self.progress_head(state).squeeze(1)  # (B,)
+
+        return u, mu, std, a_dir, conf_logit, progress_score
 
 
     def encode(self, state, action):
@@ -246,38 +259,10 @@ class VAE(nn.Module):
         return self.max_action * torch.tanh(self.d3(a))
 
 def compute_action_stats(dataset, batch_size=2048, num_workers=4, pin_memory=True,
-                         use_cuda=None, stats_path: str | None = None):
-    """
-    - 如果 stats_path 是目录：自动保存为 <stats_path>/action_stats.pt
-    - 如果 stats_path 是文件：直接用该文件名
-    - 若文件已存在则加载返回
-    """
+                         use_cuda=None):
     if use_cuda is None:
         use_cuda = torch.cuda.is_available()
     device = torch.device("cuda" if use_cuda else "cpu")
-
-    # 规范化保存路径
-    save_path = None
-    if stats_path is not None:
-        if os.path.isdir(stats_path):
-            save_path = os.path.join(stats_path, "action_stats.pt")
-        else:
-            # 既可能是“不存在的文件名”，也可能是“已存在的文件”
-            dirpath = os.path.dirname(stats_path)
-            if dirpath:
-                os.makedirs(dirpath, exist_ok=True)
-            save_path = stats_path
-
-        # 尝试读取缓存
-        if os.path.exists(save_path):
-            try:
-                data = torch.load(save_path, map_location="cpu")
-                if isinstance(data, dict) and "mean" in data and "std" in data:
-                    return data["mean"].float(), data["std"].float()
-                if isinstance(data, (list, tuple)) and len(data) == 2:
-                    return torch.as_tensor(data[0]).float(), torch.as_tensor(data[1]).float()
-            except Exception as e:
-                print(f"[WARN] Failed to load cached stats from {save_path}: {e}")
 
     # 计算
     tmp_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
@@ -304,21 +289,6 @@ def compute_action_stats(dataset, batch_size=2048, num_workers=4, pin_memory=Tru
     mean = mean_dev.cpu()
     var = var_dev.cpu()
     std  = torch.sqrt(var.clamp_min(1e-12))
-
-    # 保存
-    if save_path is not None:
-        try:
-            torch.save({"mean": mean, "std": std}, save_path)
-            print(f"[OK] Saved action stats to {save_path}")
-        except Exception as e:
-            print(f"[WARN] Failed to save stats to {save_path}: {e}")
-
-        # 额外存 .npy 方便别处用
-        try:
-            np.save(os.path.splitext(save_path)[0] + "_mean.npy", mean.numpy())
-            np.save(os.path.splitext(save_path)[0] + "_std.npy",  std.numpy())
-        except Exception as e:
-            print(f"[WARN] Failed to save npy: {e}")
 
     return mean, std
 
@@ -352,18 +322,45 @@ def split_by_trajectory(ds: H5TrajectoryDataset, val_ratio: float = 0.1, seed: i
     val_subset   = Subset(ds, sorted(val_indices))
     return train_subset, val_subset
 
+def compute_progress_loss(feature_net, vae, pair_batch, device):
+    """
+    pair_batch: (img_t, act_t, img_tp1, act_tp1) 来自 pair_dl
+    我们忽略动作，只用图像编码成 state_feat，然后用 vae.progress_head 得到 Φ
+
+    返回:
+        progress_loss (标量)
+    """
+    img_t, act_t, img_tp1, act_tp1 = pair_batch
+    img_t = img_t.to(device)
+    img_tp1 = img_tp1.to(device)
+
+    # 提取 state 特征
+    state_t = feature_net(img_t)       # (B, state_dim)
+    state_tp1 = feature_net(img_tp1)   # (B, state_dim)
+
+    # 得到 Φ(s)
+    with torch.set_grad_enabled(True):
+        phi_t = vae.progress_head(state_t).squeeze(1)       # (B,)
+        phi_tp1 = vae.progress_head(state_tp1).squeeze(1)   # (B,)
+
+    # 排序/单调性loss: 想要 phi_tp1 > phi_t
+    diff = phi_tp1 - phi_t  # (B,)
+    rank_loss = F.softplus(-diff).mean()  # log(1+exp(-diff))
+
+    return rank_loss
+
 @torch.no_grad()
-def evaluate(feature_net, vae, val_loader, act_mean, act_std, device):
+def evaluate(feature_net, vae, val_single_loader, val_pair_loader, act_mean, act_std, device):
     feature_net.eval(); vae.eval()
-    rec_total, kl_total, dir_total, conf_total, n_batch = 0.0, 0.0, 0.0, 0.0, 0
-    for img_batch, action_batch in val_loader:
+    rec_total, kl_total, dir_total, conf_total, n_batch_single = 0.0, 0.0, 0.0, 0.0, 0
+    for img_batch, action_batch in val_single_loader:
         img_batch = img_batch.to(device)
         action_batch = action_batch.to(device)
 
         img_feat = feature_net(img_batch)
         action_norm = (action_batch - act_mean) / act_std
 
-        pred_norm, mu, std, a_direction, conf_logit = vae(img_feat, action_norm)
+        pred_norm, mu, std, a_direction, conf_logit, progress_score = vae(img_feat, action_norm)
 
         # 重构损失 + KL损失
         rec_loss = F.mse_loss(pred_norm, action_norm)
@@ -390,9 +387,38 @@ def evaluate(feature_net, vae, val_loader, act_mean, act_std, device):
         kl_total += kl.item()
         dir_total += dir_loss.item()
         conf_total += conf_loss.item()
-        n_batch += 1
+        n_batch_single += 1
 
-    return rec_total / max(1, n_batch), kl_total / max(1, n_batch), dir_total / max(1, n_batch), conf_total / max(1, n_batch)
+    rec_avg = rec_total / max(1, n_batch_single)
+    kl_avg  = kl_total  / max(1, n_batch_single)
+    dir_avg = dir_total / max(1, n_batch_single)
+    conf_avg= conf_total/ max(1, n_batch_single)
+
+    # --------- 评估进展头 (progress_head) 的单调性 ---------
+    prog_total = 0.0
+    n_batch_pair = 0
+
+    for pair_batch in val_pair_loader:
+        img_t, act_t, img_tp1, act_tp1 = pair_batch
+        img_t   = img_t.to(device)
+        img_tp1 = img_tp1.to(device)
+
+        state_t   = feature_net(img_t)     # (B2, state_dim)
+        state_tp1 = feature_net(img_tp1)   # (B2, state_dim)
+
+        phi_t   = vae.progress_head(state_t).squeeze(1)     # (B2,)
+        phi_tp1 = vae.progress_head(state_tp1).squeeze(1)   # (B2,)
+
+        diff = phi_tp1 - phi_t
+        # softplus(-diff): 如果 diff<0 或不够大, loss↑
+        prog_loss = F.softplus(-diff).mean()
+
+        prog_total += prog_loss.item()
+        n_batch_pair += 1
+
+    prog_avg = prog_total / max(1, n_batch_pair)
+
+    return rec_avg, kl_avg, dir_avg, conf_avg, prog_avg
 
 if __name__ == "__main__":
     # StackCube-v1
@@ -402,7 +428,6 @@ if __name__ == "__main__":
     h5_path = "/home/wzh-2004/RewardModelTest/Maniskill3_Baseline/demos/PushCube-v1/motionplanning/trajectory.rgb.pd_joint_delta_pos.physx_cpu.h5"
 
     base_ckpt_dir = os.path.join(os.path.dirname(__file__), "ckpt_VAE")
-    stats_path = base_ckpt_dir
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     ckpt_path = os.path.join(base_ckpt_dir, timestamp)
     os.makedirs(ckpt_path, exist_ok=True)
@@ -419,6 +444,10 @@ if __name__ == "__main__":
     train_dl = DataLoader(train_ds, batch_size=128, shuffle=True, num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=4)
     val_dl   = DataLoader(val_ds,   batch_size=128, shuffle=False, num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=4)
 
+    train_pair_ds, val_pair_ds = split_by_trajectory(pair_ds, val_ratio=0.1, seed=42)
+    train_pair_dl = DataLoader(train_pair_ds, batch_size=64, shuffle=True, num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=4)
+    val_pair_dl   = DataLoader(val_pair_ds,   batch_size=64, shuffle=False, num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=4)
+
     # 取出一条样本，用于初始化网络
     img, act = ds[0]          # 第 0 条样本 (img: (2C,H,W), act: (A,))
     feature_net = SmallCNN(in_ch=img.shape[0], feat_dim=256).to(device)
@@ -431,7 +460,7 @@ if __name__ == "__main__":
     print(f"VAE parameters: state_dim={state_dim}, action_dim={action_dim}, latent_dim={latent_dim}, max_action={max_action}, device={device}")
 
     # 计算动作均值和标准差
-    act_mean_full, act_std_full = compute_action_stats(train_ds, stats_path=stats_path)   # ds 是上面 make_loader 返回的 Dataset
+    act_mean_full, act_std_full = compute_action_stats(train_ds)   # ds 是上面 make_loader 返回的 Dataset
     act_mean_full = act_mean_full.to(device)
     act_std_full  = act_std_full.to(device)
     act_mean_full.requires_grad_(False)
@@ -451,6 +480,7 @@ if __name__ == "__main__":
     best_val = float("inf")
     λ_dir = 1.0
     λ_conf = 1.0
+    λ_prog = 1.0
 
     for epoch in range(epochs):
         print(f"Starting Training Epoch {epoch+1}/{epochs}:")
@@ -468,6 +498,9 @@ if __name__ == "__main__":
         elif epoch >= epochs // 8:
             λ_conf = 0.1
 
+        # 循环迭代器，以便用来训练进度头
+        pair_iter = iter(train_pair_dl)
+
         for img_batch, action_batch in train_dl:
             img_batch = img_batch.to(device)       # (B, 2C, H, W)
             action_batch = action_batch.to(device) # (B, A)
@@ -478,7 +511,7 @@ if __name__ == "__main__":
 
             # 标准化动作
             action_batch_norm = (action_batch - act_mean_full) / act_std_full
-            pred_norm, mu, std, a_direction, conf_logit = vae(img_feat, action_batch_norm)
+            pred_norm, mu, std, a_direction, conf_logit, progress_score_dummy = vae(img_feat, action_batch_norm)
 
             rec_loss = F.mse_loss(pred_norm, action_batch_norm)
             # KL = 0.5 * sum( std^2 + mu^2 - 1 - log(std^2) )
@@ -503,7 +536,33 @@ if __name__ == "__main__":
             bce_neg = F.binary_cross_entropy_with_logits(conf_neg, y_neg)
             conf_loss = 0.5 * (bce_pos + bce_neg)
 
-            loss = rec_loss + kl + λ_dir * direction_loss + λ_conf * conf_loss
+            ##############
+            # 进展度损失
+            try:
+                pair_batch = next(pair_iter)
+            except StopIteration:
+                pair_iter = iter(pair_dl)
+                pair_batch = next(pair_iter)
+
+            # pair_batch 是 (img_t, act_t, img_tp1, act_tp1)
+            img_t, act_t, img_tp1, act_tp1 = pair_batch
+            img_t = img_t.to(device)
+            img_tp1 = img_tp1.to(device)
+
+            state_t   = feature_net(img_t)     # (B2, state_dim)
+            state_tp1 = feature_net(img_tp1)   # (B2, state_dim)
+
+            phi_t     = vae.progress_head(state_t).squeeze(1)      # (B2,)
+            phi_tp1   = vae.progress_head(state_tp1).squeeze(1)    # (B2,)
+
+            diff      = phi_tp1 - phi_t                             # 我们希望这个是正的
+            progress_loss = F.softplus(-diff).mean()                # log(1+exp(-diff))
+
+            phi_all = torch.cat([phi_t, phi_tp1], dim=0)  # (2B,)
+            β_range = 1e-4
+            range_reg = (phi_all ** 2).mean() * β_range
+
+            loss = rec_loss + kl + λ_dir * direction_loss + λ_conf * conf_loss + λ_prog * progress_loss + range_reg
 
             optim.zero_grad(set_to_none=True)
             loss.backward()
@@ -512,14 +571,15 @@ if __name__ == "__main__":
             running += loss.item()
 
         train_loss = running / max(1, len(train_dl))
-        val_rec, val_kl, val_dir, val_conf = evaluate(feature_net, vae, val_dl, act_mean_full, act_std_full, device)
-        monitor_val_loss =  val_rec + val_kl + λ_dir * val_dir
+        val_rec, val_kl, val_dir, val_conf, val_prog = evaluate(feature_net, vae, val_dl, val_pair_dl, act_mean_full, act_std_full, device)
+        monitor_val_loss =  val_rec + val_kl + λ_dir * val_dir + + λ_prog * val_prog
         val_loss = monitor_val_loss + λ_conf * val_conf
         print(f"[epoch {epoch+1}/{epochs}] train_loss={train_loss:.4f} | "
             f"val_loss={val_loss:.4f} | "
             f"monitor_val_loss={monitor_val_loss:.4f} | "
             f"val_rec={val_rec:.4f} val_kl={val_kl:.4f} "
-            f"val_dir={val_dir:.4f} val_conf={val_conf:.4f}")
+            f"val_dir={val_dir:.4f} val_conf={val_conf:.4f} val_prog={val_prog:.4f}",
+            )
 
         # 调整学习率
         scheduler.step(monitor_val_loss)
@@ -533,6 +593,7 @@ if __name__ == "__main__":
                 "vae": vae.state_dict(),
                 "dir_head": vae.dir_head.state_dict(),
                 "dyn_head": vae.conf_head.state_dict(),
+                "progress_head":  vae.progress_head.state_dict(),
                 "act_mean": act_mean_full.detach().cpu(),
                 "act_std": act_std_full.detach().cpu(),
             }, os.path.join(ckpt_path, "vae_best.pt"))
