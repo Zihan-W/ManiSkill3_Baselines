@@ -1,0 +1,47 @@
+# configs/base.yaml
+task: "StackCube-v1"
+
+model:
+  name: MDN
+  K: 10
+  hidden: 512
+  dropout: 0.1
+
+run:
+  # ckpt保存模板，例：StackCube-v1_L32_S42_20251029-113015
+  tpl: "{task}_L{model.latent_dim}_S{data.seed}_{date:%Y%m%d-%H%M%S}"
+
+paths:
+  # h5_dataset_path: "/home/wzh-2004/RewardModelTest/Maniskill3_Baseline/demos/StackCube-v1/motionplanning/trajectory.rgb.pd_joint_delta_pos.physx_cpu.h5"
+  h5_dataset_path: "/home/wzh-2004/Downloads/trajectory.h5"   # 数据集路径
+  ckpt_root: "${here}/ckpt/{model.name}" # 解析成：入口脚本(train.py)所在目录/ckpt_VAE
+  # 也支持：
+  # ckpt_root: "${cwd}/ckpt_VAE"  # 当前工作目录
+  # ckpt_root: "${home}/proj/ckpt"_VAE"  # 用户主目录下的 proj/ckpt_VAE
+  save_ckpt_dir: "{paths.ckpt_root}/{run}"
+  load_model_path: "/home/wzh-2004/ManiSkill3_Baselines/ms3_baselines/model/ckpt/MDN/StackCube-v1_L32_S42_20251029-173841/mdn_best.pt"
+
+data:
+  img_size: null          # 例如: 128
+  num_workers: 8
+  batch_size: 128
+  pair_batch_size: 256
+  val_ratio: 0.1
+  seed: 42
+  max_samples_probe: 20000
+
+train:
+  epochs: 100
+  lr: 1.0e-3
+  min_lr: 1.0e-6
+  plateau_patience: 5
+
+reward:
+  lambda_z: 0.2           # 潜空间能量权重
+  lambda_epi: 0.2         # epistemic 不确定性权重
+  lambda_dyn: 0.1         # 动力学一致性权重（若启用pair正则）
+
+log:
+  curve_png: "loss_curve.png"
+  wandb_project: "Distribution_Wrapper"
+  wandb_group: "{task}_{model.name}"
