@@ -209,3 +209,6 @@ __marimo__/
 wandb/
 runs/
 ckpt_VAE/
+ckpt/
+probe_out/
+reward_viz/

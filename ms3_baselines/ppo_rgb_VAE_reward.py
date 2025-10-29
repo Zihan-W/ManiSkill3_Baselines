@@ -26,9 +26,21 @@ from VAE.VAE_reward import load_VAE_reward_model
 @dataclass
 class Args:
 
-    vae_reward_coef: float = 0.2
+    # ====== VAE shaping reward相关系数 ======
+    vae_reward_coef: float = 1.0
+    """global scale applied to all VAE-style intrinsic rewards"""
+
     vae_distance_reward_coef: float = 0.1
-    vae_forward_reward_coef: float = 1.0
+    """weight on action reconstruction (-MSE) reward"""
+
+    vae_forward_reward_coef: float = 0.1
+    """weight on direction / alignment reward (cos sim)"""
+
+    vae_progress_reward_coef: float = 1.0
+    """weight on progress delta reward φ(s_{t+1})-φ(s_t)"""
+
+    time_penalty_coef: float = 0.01
+    """per-step penalty encouraging faster completion"""
 
     exp_name: Optional[str] = None
     """the name of this experiment"""
@@ -59,7 +71,7 @@ class Args:
     """the environment rendering mode"""
 
     # Algorithm specific arguments
-    env_id: str = "PushCube-v1"
+    env_id: str = "StackCube-v1"
     """the id of the environment"""
     include_state: bool = True
     """whether to include state information in observations"""
@@ -67,7 +79,7 @@ class Args:
     """total timesteps of the experiments"""
     learning_rate: float = 3e-4
     """the learning rate of the optimizer"""
-    num_envs: int = 256
+    num_envs: int = 128
     """the number of parallel environments"""
     num_eval_envs: int = 10
     """the number of parallel evaluation environments"""
@@ -101,7 +113,7 @@ class Args:
     """the surrogate clipping coefficient"""
     clip_vloss: bool = False
     """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
-    ent_coef: float = 0.0
+    ent_coef: float = 0.1
     """coefficient of the entropy"""
     vf_coef: float = 0.5
     """coefficient of the value function"""
@@ -393,6 +405,8 @@ if __name__ == "__main__":
     eval_obs, _ = eval_envs.reset(seed=args.seed)
     next_done = torch.zeros(args.num_envs, device=device)
     eps_returns = torch.zeros(args.num_envs, dtype=torch.float, device=device)
+    # === 初始化 prev_reward 用于 delta reward ===
+    prev_reward = torch.zeros(args.num_envs, device=device)
     print(f"####")
     print(f"args.num_iterations={args.num_iterations} args.num_envs={args.num_envs} args.num_eval_envs={args.num_eval_envs}")
     print(f"args.minibatch_size={args.minibatch_size} args.batch_size={args.batch_size} args.update_epochs={args.update_epochs}")
@@ -403,7 +417,7 @@ if __name__ == "__main__":
     # === 加载已训练的 VAE，用于奖励 ===
     _img = next_obs["rgb"][0].permute(2,0,1).to(device)
     _act = actions[0][0].to(device)
-    vae = load_VAE_reward_model(_img, _act, None, device=device)
+    vae_reward_model = load_VAE_reward_model(_img, _act, None, device=device)
 
     if args.checkpoint:
         agent.load_state_dict(torch.load(args.checkpoint))
@@ -481,18 +495,18 @@ if __name__ == "__main__":
             next_obs = {k: v.to(device, non_blocking=True) for k, v in next_obs.items()}
 
             next_done = torch.logical_or(terminations, truncations).to(torch.float32)
-            rewards[step] = reward.view(-1) * args.reward_scale
 
             # === VAE 流形奖励：用 obs[step] 和 actions[step]（即 (s_t, a_t)）===
             _imgs = obs[step]["rgb"]
             _acts = actions[step]
 
             # 计算奖励
-            distance_rewards, forward_rewards = vae.compute_reward(_imgs, _acts)
+            distance_rewards, forward_rewards = vae_reward_model.compute_reward(_imgs, _acts)
 
             # 计算惩罚
-            time_penalty = vae.compute_penalty(forward_rewards, time_penalty_coef=0.01)
-            vae_rewards = torch.tensor(args.vae_distance_reward_coef * distance_rewards + args.vae_forward_reward_coef * forward_rewards).to(device)
+            forward_rewards_tensor = torch.as_tensor(forward_rewards, device=device)
+            time_penalty = vae_reward_model.compute_penalty(forward_rewards_tensor, time_penalty_coef=0.01)
+            vae_rewards = torch.tensor(args.vae_distance_reward_coef * distance_rewards + 0 * args.vae_forward_reward_coef * forward_rewards).to(device)
 
             _env_reward = reward.clone().float()
 
@@ -504,7 +518,15 @@ if __name__ == "__main__":
                 logger.add_scalar("debug/original_forward_rewards", forward_rewards.mean().item(), global_step)
             # 合并奖励
             # reward = torch.zeros_like(reward)
-            rewards[step] = (reward.view(-1) + args.vae_reward_coef * vae_rewards) * args.reward_scale
+            # === 计算当前 step 的真实 reward ===
+            reward_new = (reward.view(-1) + args.vae_reward_coef * vae_rewards) * args.reward_scale
+            # === delta reward 计算 ===
+            delta_reward = reward_new - prev_reward
+            rewards[step] = delta_reward
+            prev_reward = reward_new.clone()
+            # 在 episode 结束时，将 prev_reward 对应环境归零，避免跨 episode 累积
+            if next_done.sum() > 0:
+                prev_reward = prev_reward * (1 - next_done)
 
             if "final_info" in infos:
                 final_info = infos["final_info"]
