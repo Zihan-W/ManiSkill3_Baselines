@@ -8,24 +8,6 @@ import torch.nn as nn
 from typing import List, Tuple, Dict, Optional
 from torch.utils.data import TensorDataset,Dataset,DataLoader,random_split, Subset
 
-# 实现简单的CNN编码器
-class SmallCNN(nn.Module):
-    def __init__(self, in_ch=6, feat_dim=256):
-        super().__init__()
-        self.feat_dim = feat_dim
-        self.net = nn.Sequential(
-            nn.Conv2d(in_ch, 32, 5, stride=2, padding=2), nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, 5, stride=2, padding=2),   nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, 3, stride=2, padding=1),  nn.ReLU(inplace=True),
-            nn.Conv2d(128, 256, 3, stride=2, padding=1), nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d(1),
-        )
-        self.fc = nn.Linear(256, feat_dim)
-
-    def forward(self, x):
-        x = self.net(x).flatten(1)
-        return self.fc(x)
-
 class H5TrajectoryDataset(Dataset):
     """
     统一版 HDF5 轨迹数据集：
@@ -48,13 +30,15 @@ class H5TrajectoryDataset(Dataset):
                  h5_path: str,
                  mode: str = "single",      # 'single' or 'pair'
                  img_size: Optional[int] = None,
-                 traj_whitelist: Optional[List[str]] = None):
+                 traj_whitelist: Optional[List[str]] = None,
+                 camera_mask: Optional[List[str]] = None):
         super().__init__()
         assert mode in ("single", "pair")
         self.h5_path = h5_path
         self.mode = mode
         self.img_size = img_size
         self._h5 = None  # lazy open
+        self.camera_mask = camera_mask
 
         self.indices: List[Tuple[str,int]] = []        # (traj_key, t) 仅起点
         self.traj_to_idxs: Dict[str, List[int]] = {}   # 每条轨迹对应的 dataset 索引（for 'single' 模式）
@@ -112,16 +96,29 @@ class H5TrajectoryDataset(Dataset):
 
         a = traj["actions"][t]  # (A,)
 
+        qpos = traj["obs/agent/qpos"][t]
+        # ensure qpos is a torch tensor (HDF5 returns numpy arrays)
+        if not isinstance(qpos, torch.Tensor):
+            qpos = torch.from_numpy(qpos).float()
+
+        # normalize camera_mask to a set of strings for exclusion
+        if self.camera_mask is None:
+            mask_set = set()
+        elif isinstance(self.camera_mask, str):
+            mask_set = {self.camera_mask}
+        else:
+            mask_set = set(self.camera_mask)
+
         imgs = []
-        if has_base:
+        if has_base and "base" not in mask_set:
             base = torch.from_numpy(base).permute(2, 0, 1).float() / 255.0  # (C,H,W)
             imgs.append(base)
-        if has_hand:
+        if has_hand and "hand" not in mask_set:
             hand = torch.from_numpy(hand).permute(2, 0, 1).float() / 255.0  # (C,H,W)
             imgs.append(hand)
 
         if len(imgs) == 0:
-            raise RuntimeError(f"{traj_key} at t={t} has no camera frames")
+            raise RuntimeError(f"{traj_key} at t={t} has no camera frames after applying camera_mask={self.camera_mask}")
 
         img = torch.cat(imgs, dim=0) if len(imgs) > 1 else imgs[0]  # (C or 2C, H, W)
 
@@ -130,20 +127,21 @@ class H5TrajectoryDataset(Dataset):
                                 mode="bilinear", align_corners=False).squeeze(0)
 
         act = torch.from_numpy(a).float()  # (A,)
-        return img, act
+
+        return img, act, qpos
 
 
     def __getitem__(self, idx: int):
         self._ensure_open()
         traj_key, t = self.indices[idx]
         if self.mode == "single":
-            img, act = self._load_one(traj_key, t)
-            return img, act
+            img, act, qpos = self._load_one(traj_key, t)
+            return img, act, qpos
         else:
             # pair: (t, t+1) 保证是同一条轨迹
-            img_t,  act_t  = self._load_one(traj_key, t)
-            img_tp1,act_tp1 = self._load_one(traj_key, t+1)
-            return img_t, act_t, img_tp1, act_tp1
+            img_t,  act_t, qpos_t = self._load_one(traj_key, t)
+            img_tp1,act_tp1, qpos_tp1 = self._load_one(traj_key, t+1)
+            return img_t, act_t, img_tp1, act_tp1, qpos_t, qpos_tp1
 
     # ======= 一些实用辅助 =======
 
@@ -163,10 +161,11 @@ def make_loader(h5_path: str,
                 num_workers: int = 0,
                 mode: str = "single",
                 img_size: Optional[int] = None,
-                traj_whitelist: Optional[List[str]] = None):
+                traj_whitelist: Optional[List[str]] = None,
+                camera_mask: Optional[List[str]] = None):
     persistent = (num_workers > 0)
     prefetch = 4 if num_workers > 0 else None
-    ds = H5TrajectoryDataset(h5_path=h5_path, mode=mode, img_size=img_size, traj_whitelist=traj_whitelist)
+    ds = H5TrajectoryDataset(h5_path=h5_path, mode=mode, img_size=img_size, traj_whitelist=traj_whitelist, camera_mask=camera_mask)
     dl = DataLoader(
         ds, batch_size=batch_size, shuffle=shuffle,
         num_workers=num_workers, pin_memory=True,
@@ -193,7 +192,7 @@ def compute_action_stats(dataset, batch_size=2048, num_workers=4, pin_memory=Tru
     s1 = None
     s2 = None
     with torch.no_grad():
-        for _, a in loader:
+        for _, a, _ in loader:
             if use_cuda:
                 a = a.to(device, non_blocking=True)
             a = a.float()
@@ -207,6 +206,47 @@ def compute_action_stats(dataset, batch_size=2048, num_workers=4, pin_memory=Tru
 
     if s1 is None:
         raise RuntimeError("No data found in dataset to compute action stats")
+
+    mean_dev = s1 / n
+    var_dev = s2 / n - mean_dev ** 2
+    mean = mean_dev.cpu().float()
+    std = torch.sqrt(var_dev.clamp_min(1e-12)).cpu().float()
+
+    return mean, std
+
+
+def compute_qpos_stats(dataset, batch_size=2048, num_workers=4, pin_memory=True,
+                       use_cuda=None, stats_path: str | None = None):
+    """
+    计算 dataset 中 qpos 的均值和标准差。Dataset 应返回 (img, act, qpos) 的三元组。
+    返回 (mean, std) 均为 CPU 上的 torch.FloatTensor。
+    """
+    if use_cuda is None:
+        use_cuda = torch.cuda.is_available()
+    device = torch.device("cuda" if use_cuda else "cpu")
+
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
+                        num_workers=num_workers, pin_memory=pin_memory,
+                        persistent_workers=(num_workers > 0))
+
+    n = 0
+    s1 = None
+    s2 = None
+    with torch.no_grad():
+        for _, _, q in loader:
+            if use_cuda:
+                q = q.to(device, non_blocking=True)
+            q = q.float()
+            if s1 is None:
+                s1 = q.sum(dim=0)
+                s2 = (q * q).sum(dim=0)
+            else:
+                s1 = s1 + q.sum(dim=0)
+                s2 = s2 + (q * q).sum(dim=0)
+            n += q.shape[0]
+
+    if s1 is None:
+        raise RuntimeError("No data found in dataset to compute qpos stats")
 
     mean_dev = s1 / n
     var_dev = s2 / n - mean_dev ** 2

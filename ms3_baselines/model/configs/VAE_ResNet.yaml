@@ -1,10 +1,11 @@
 # configs/base.yaml
+# task: "PushCube-v1"
 task: "StackCube-v1"
 
 model:
-  name: "VAE"
+  name: "VAE_ResNet"
   feat_dim: 256
-  latent_dim: 32
+  latent_dim: 8
   max_action: 1.0
 
 run:
@@ -12,14 +13,17 @@ run:
   tpl: "{task}_L{model.latent_dim}_S{data.seed}_{date:%Y%m%d-%H%M%S}"
 
 paths:
-  h5_dataset_path: "/home/wzh-2004/RewardModelTest/Maniskill3_Baseline/demos/StackCube-v1/motionplanning/trajectory.rgb.pd_joint_delta_pos.physx_cpu.h5"
-  # h5_dataset_path: "/home/wzh-2004/Downloads/trajectory.h5"   # 数据集路径
+  train_h5_dataset_path: "/home/wzh-2004/RewardModelTest/Maniskill3_Baseline/demos/StackCube-v1/motionplanning/trajectory.rgb.pd_joint_delta_pos.physx_cpu.h5"
+  test_h5_dataset_path: "/home/wzh-2004/Downloads/trajectory.h5"   # 数据集路径
+  # test_h5_dataset_path: "/home/wzh-2004/RewardModelTest/Maniskill3_Baseline/demos/StackCube-v1/motionplanning/trajectory.rgb.pd_joint_delta_pos.physx_cpu.h5"   # 数据集路径
+  # h5_dataset_path: "/home/wzh-2004/RewardModelTest/Maniskill3_Baseline/demos/PushCube-v1/motionplanning/trajectory.rgb.pd_joint_delta_pos.physx_cpu.h5"
+
   ckpt_root: "${here}/ckpt/{model.name}" # 解析成：入口脚本(train.py)所在目录/ckpt_VAE
   # 也支持：
   # ckpt_root: "${cwd}/ckpt_VAE"  # 当前工作目录
   # ckpt_root: "${home}/proj/ckpt"_VAE"  # 用户主目录下的 proj/ckpt_VAE
   save_ckpt_dir: "{paths.ckpt_root}/{run}"
-  load_model_path: "/home/wzh-2004/ManiSkill3_Baselines/ms3_baselines/model/ckpt/VAE/StackCube-v1_L32_S42_20251030-161747/vae_best.pt"
+  load_model_path: "/home/wzh-2004/ManiSkill3_Baselines/ms3_baselines/model/ckpt/VAE_ResNet/StackCube-v1_L8_S42_20251030-211351/vae_best.pt"
 
 data:
   img_size: null          # 例如: 128

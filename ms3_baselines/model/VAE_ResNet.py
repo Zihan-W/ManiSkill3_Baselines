@@ -15,107 +15,21 @@ from datetime import datetime
 import matplotlib.pyplot as plt
 
 from utils import make_loader, split_by_trajectory, compute_action_stats, compute_qpos_stats
-from vision_encoder import SmallCNN
+from vision_encoder import LateFusionResNet
 
-# Vanilla Variational Auto-Encoder
-class VAE(nn.Module):
-    def __init__(self, state_dim, qpos_dim, action_dim, latent_dim, max_action, device,
-                 hidden=256, dropout=0.1):
-        super(VAE, self).__init__()
-        # Encoder
-        self.e1 = nn.Linear(state_dim + qpos_dim, hidden)
-        self.e2 = nn.Linear(hidden, hidden)
-        self.dropout_e = nn.Dropout(dropout)
-
-        self.mean = nn.Linear(hidden, latent_dim)
-        self.log_std = nn.Linear(hidden, latent_dim)
-
-        # Decoder: predict actions (decoder output dimension = action_dim)
-        self.d1 = nn.Linear(state_dim + latent_dim, hidden)
-        self.d2 = nn.Linear(hidden, hidden)
-        self.d3 = nn.Linear(hidden, action_dim)
-        self.dropout_d = nn.Dropout(dropout)
-
-        self.max_action = max_action
-        self.latent_dim = latent_dim
-        self.device = device
-
-    def forward(self, state, qpos):
-        # VAE: encode using state and qpos (qpos should be normalized already)
-        z = self.encode(state, qpos)
-        mu = self.mean(z)
-        # Clamped for numerical stability
-        log_std = self.log_std(z).clamp(-4, 15)
-        std = torch.exp(log_std)
-        z = mu + std * torch.randn_like(std)
-
-        u = self.decode(state, z)
-
-        return u, mu, std
-
-    def encode(self, state, qpos):
-        z = F.relu(self.e1(torch.cat([state, qpos], 1)))
-        z = self.dropout_e(z)
-        z = F.relu(self.e2(z))
-        z = self.dropout_e(z)
-        return z
-
-    def decode(self, state, z=None):
-        # When sampling from the VAE, the latent vector is clipped to [-0.5, 0.5]
-        if z is None:
-            z = torch.randn((state.shape[0], self.latent_dim)).to(self.device).clamp(-0.5, 0.5)
-
-        a = F.relu(self.d1(torch.cat([state, z], 1)))
-        a = self.dropout_d(a)
-        a = F.relu(self.d2(a))
-        a = self.dropout_d(a)
-        return self.max_action * torch.tanh(self.d3(a))
-
-@torch.no_grad()
-def evaluate(feature_net, vae, val_loader, act_mean, act_std, qpos_mean, qpos_std, device):
-    feature_net.eval(); vae.eval()
-    act_mean = act_mean.to(device)
-    act_std = act_std.to(device)
-    qpos_mean = qpos_mean.to(device)
-    qpos_std = qpos_std.to(device)
-    rec_total, kl_total, n_batch = 0.0, 0.0, 0.0
-    for img_batch, action_batch, qpos_batch in val_loader:
-        img_batch = img_batch.to(device, non_blocking=True)
-        action_batch = action_batch.to(device, non_blocking=True)
-        qpos_batch = qpos_batch.to(device, non_blocking=True)
-
-        img_feat = feature_net(img_batch)
-        action_norm = (action_batch - act_mean) / (act_std + 1e-12)
-        qpos_norm = (qpos_batch - qpos_mean) / (qpos_std + 1e-12)
-
-        # VAE now takes (state, qpos_norm) and returns reconstructed action (in original scale)
-        pred_action, mu, std = vae(img_feat, qpos_norm)
-        # normalize predicted action to compare in normalized space
-        pred_norm = (pred_action - act_mean) / (act_std + 1e-12)
-
-        # 重构损失 + KL损失
-        rec_loss = F.mse_loss(pred_norm, action_norm)
-        log_std  = std.clamp_min(1e-8).log()
-        kl       = -0.5 * torch.mean(torch.sum(1 + 2*log_std - mu.pow(2) - std.pow(2), dim=1))
-
-        rec_total += rec_loss.item()
-        kl_total += kl.item()
-        n_batch += 1
-
-    return rec_total / max(1, n_batch), kl_total / max(1, n_batch)
+from VAE import VAE, evaluate, testing
 
 class VAEReward:
     def __init__(self, img, act, qpos, latent_dim, max_action, model_path, device):
         self.device = device
 
-        self.feature_net = SmallCNN(in_ch=img.shape[0], feat_dim=256).to(device)
+        self.feature_net = LateFusionResNet(in_channels=img.shape[0], feat_dim=256, pretrained=True).to(device)
         self.state_dim = self.feature_net.feat_dim
         self.action_dim = act.shape[0]
         self.qpos_dim = qpos.shape[0]
         self.latent_dim = latent_dim
         self.max_action = max_action
 
-        # VAE now uses (state, qpos) -> action
         self.vae = VAE(state_dim=self.state_dim,
                        qpos_dim=self.qpos_dim,
                        action_dim=self.action_dim,
@@ -129,13 +43,17 @@ class VAEReward:
 
         _feature_net_sd = _sd['feature_net']
         _vae_sd = _sd['model']
-        _act_mean = _sd.get('act_mean', None)
-        _act_std  = _sd.get('act_std', None)
+        _act_mean = _sd['act_mean']
+        _act_std  = _sd['act_std']
         _qpos_mean = _sd.get('qpos_mean', None)
         _qpos_std  = _sd.get('qpos_std', None)
 
         self.feature_net.load_state_dict(_feature_net_sd)
         self.vae.load_state_dict(_vae_sd)
+
+        self.feature_net.eval()
+        self.vae.eval()
+
         # action stats (fallback to zeros/ones if missing)
         if _act_mean is None or _act_std is None:
             # safe fallback
@@ -241,14 +159,72 @@ class VAEReward:
         time_penalty = - time_penalty_coef * torch.ones_like(forward_rewards)
         return time_penalty + forward_rewards
 
+def normalize_imagenet_6c(x, device):
+    # Accept list/tuple of tensors (collated oddly) or a tensor
+    if isinstance(x, (list, tuple)):
+        try:
+            x = torch.stack(x, dim=0)
+        except Exception:
+            # fallback: convert elements to tensor then stack
+            x = torch.stack([torch.as_tensor(xx) for xx in x], dim=0)
+
+    if not isinstance(x, torch.Tensor):
+        x = torch.as_tensor(x)
+
+    # ensure channel dimension exists
+    if x.dim() < 4:
+        raise ValueError(f"normalize_imagenet_6c expects a 4D tensor (B,C,H,W), got shape={x.shape}")
+
+    _dim = int(x.shape[1])
+    if _dim % 3 != 0:
+        raise ValueError(f"channel dimension {_dim} is not a multiple of 3 for Imagenet normalization")
+    _count = _dim // 3
+    mean = torch.tensor([0.485, 0.456, 0.406] * _count, device=device).view(1, _dim, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225] * _count, device=device).view(1, _dim, 1, 1)
+    x = x.to(device=device)
+    return (x - mean) / std
+
+@torch.no_grad()
+def evaluate(feature_net, vae, val_loader, act_mean, act_std, qpos_mean, qpos_std, device):
+    feature_net.eval()
+    vae.eval()
+    act_mean = act_mean.to(device)
+    act_std = act_std.to(device)
+    qpos_mean = qpos_mean.to(device)
+    qpos_std = qpos_std.to(device)
+    rec_total, kl_total, n_batch = 0.0, 0.0, 0.0
+    for img_batch, action_batch, qpos_batch in val_loader:
+        img_batch = img_batch.to(device, non_blocking=True)
+        img_batch = normalize_imagenet_6c(img_batch, device)
+        action_batch = action_batch.to(device, non_blocking=True)
+        qpos_batch = qpos_batch.to(device, non_blocking=True)
+
+        img_feat = feature_net(img_batch)
+        action_norm = (action_batch - act_mean) / (act_std + 1e-12)
+        qpos_norm = (qpos_batch - qpos_mean) / (qpos_std + 1e-12)
+
+        pred_action, mu, std = vae(img_feat, qpos_norm)
+        pred_norm = (pred_action - act_mean) / (act_std + 1e-12)
+
+        # 重构损失 + KL损失
+        rec_loss = F.mse_loss(pred_norm, action_norm)
+        log_std  = std.clamp_min(1e-8).log()
+        kl       = -0.5 * torch.mean(torch.sum(1 + 2*log_std - mu.pow(2) - std.pow(2), dim=1))
+
+        rec_total += rec_loss.item()
+        kl_total += kl.item()
+        n_batch += 1
+
+    return rec_total / max(1, n_batch), kl_total / max(1, n_batch)
+
 def testing():
     from configs.cfg_parser import parse_cfg
-    cfg_name = 'VAE'
+    cfg_name = 'VAE_ResNet'
     cfg = parse_cfg(cfg_name) if cfg_name is not None else parse_cfg()
 
     # 加载路径
-    h5_path = cfg["paths"]["h5_dataset_path"]
-    save_eval_dir  = "runs/test_vae_reward"  # 临时保存目录
+    h5_path = cfg["paths"]["test_h5_dataset_path"]
+    save_eval_dir  = "runs/" + cfg['model']['name'] + "_" + cfg['task']  # 临时保存目录
     load_model_path= cfg["paths"]["load_model_path"]
     latent_dim = cfg["model"]["latent_dim"]
     max_action = cfg["model"]["max_action"]
@@ -257,7 +233,7 @@ def testing():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # 创建数据集和数据加载器
-    ds, dl = make_loader(h5_path, mode="single", img_size=None, num_workers=16)
+    ds, dl = make_loader(h5_path, mode="single", img_size=None, num_workers=16, camera_mask=['base'])
 
     # 取出一条样本，用于初始化网络
     img, act, qpos = ds[0]         # 第 0 条样本 (img: (2C,H,W), act: (A,), qpos: (Q,))
@@ -283,9 +259,9 @@ def testing():
         # 从 dataset 读取并堆叠为 batch
         imgs = torch.stack([ds[i][0] for i in batch_idxs], dim=0)   # (B, 2C, H, W)
         acts = torch.stack([ds[i][1] for i in batch_idxs], dim=0)   # (B, A)
-        qposs = torch.stack([ds[i][2] for i in batch_idxs], dim=0)  # (B, Q)
+        qpos = torch.stack([ds[i][2] for i in batch_idxs], dim=0)   # (B, Q)
         # 计算 reward（VAEReward.compute_reward 返回 numpy array (B,)）
-        batch_recon_rewards = vae_reward.compute_reward(imgs, acts, qposs)
+        batch_recon_rewards = vae_reward.compute_reward(imgs, acts, qpos)
         recon_rewards_list.append(batch_recon_rewards)
     print("Recon rewards:", recon_rewards_list)
 
@@ -320,19 +296,19 @@ def testing():
 
 def main():
     from configs.cfg_parser import parse_cfg
-    cfg_name = 'VAE'
+    cfg_name = 'VAE_ResNet'
     cfg = parse_cfg(cfg_name) if cfg_name is not None else parse_cfg()
 
     # 加载路径
-    h5_path = cfg["paths"]["h5_dataset_path"]
+    h5_path = cfg["paths"]["train_h5_dataset_path"]
     save_ckpt_dir = cfg["paths"]["save_ckpt_dir"]
     print(f"save_ckpt_dir: {save_ckpt_dir}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 创建数据集和数据加载器
-    ds, dl = make_loader(h5_path, mode="single", img_size=None, num_workers=16)
-    pair_ds, pair_dl = make_loader(h5_path, mode="pair", batch_size=265, num_workers=16)
+    # 创建数据集和数据加载器ResNet
+    ds, dl = make_loader(h5_path, mode="single", img_size=None, num_workers=16, camera_mask=['base'])
+    pair_ds, pair_dl = make_loader(h5_path, mode="pair", batch_size=265, num_workers=16, camera_mask=['base'])
 
     # 划分训练集和验证集
     train_ds, val_ds = split_by_trajectory(ds, val_ratio=0.1, seed=42)
@@ -341,11 +317,26 @@ def main():
 
     # 取出一条样本，用于初始化网络
     img, act, qpos = ds[0]          # 第 0 条样本 (img: (2C,H,W), act: (A,), qpos: (Q,))
-    feature_net = SmallCNN(in_ch=img.shape[0], feat_dim=256).to(device)
+    feature_net = LateFusionResNet(in_channels=img.shape[0], feat_dim=256, pretrained=True).to(device)
+
+    # 冻结所有 encoder 参数
+    for param in feature_net.encoder_left.parameters():
+        param.requires_grad = False
+    for param in feature_net.encoder_right.parameters():
+        param.requires_grad = False
+
+    # 只训练 fusion 层 + fc_left + fc_right
+    for param in feature_net.fc_left.parameters():
+        param.requires_grad = True
+    for param in feature_net.fc_right.parameters():
+        param.requires_grad = True
+    for param in feature_net.fusion.parameters():
+        param.requires_grad = True
+
     state_dim = feature_net.feat_dim
     action_dim = act.shape[0]
     qpos_dim = qpos.shape[0]
-    latent_dim = 32
+    latent_dim = 8
     max_action = 1.0
     vae = VAE(state_dim=state_dim, qpos_dim=qpos_dim, action_dim=action_dim, latent_dim=latent_dim, max_action=max_action, device=device).to(device)
     print("successfully create VAE")
@@ -357,10 +348,10 @@ def main():
     act_std_full  = act_std_full.to(device)
     act_mean_full.requires_grad_(False)
     act_std_full.requires_grad_(False)
-    # 计算 qpos 的均值和标准差
+    # 计算 qpos stats
     qpos_mean_full, qpos_std_full = compute_qpos_stats(train_ds)
     qpos_mean_full = qpos_mean_full.to(device)
-    qpos_std_full  = qpos_std_full.to(device)
+    qpos_std_full = qpos_std_full.to(device)
     qpos_mean_full.requires_grad_(False)
     qpos_std_full.requires_grad_(False)
     print(f"[act stats] mean[:4]={act_mean_full[:4].tolist()}, std[:4]={act_std_full[:4].tolist()}")
@@ -389,24 +380,33 @@ def main():
     train_loss_history = []
     val_loss_history = []
 
+    def kl_beta_schedule(epoch, max_beta=0.2, warmup_epochs=30):
+        return min(max_beta, (epoch + 1) / warmup_epochs * max_beta)
+
     for epoch in range(epochs):
         print(f"Starting Training Epoch {epoch+1}/{epochs}:")
         feature_net.train()
         vae.train()
         running = 0.0
+        rec_loss_epoch = 0.0
+        kl_loss_epoch = 0.0
+
+        beta = kl_beta_schedule(epoch)
 
         for img_batch, action_batch, qpos_batch in train_dl:
             img_batch = img_batch.to(device)       # (B, 2C, H, W)
+            img_batch = normalize_imagenet_6c(img_batch, device)
             action_batch = action_batch.to(device) # (B, A)
             qpos_batch = qpos_batch.to(device)     # (B, Q)
             # imgs: (B, C, H, W)  acts: (B, A)
+            # print("img_batch.shape, action_batch.shape", img_batch.shape, action_batch.shape)
             img_feat = feature_net(img_batch)  # (B, state_dim)
+            # print("img_feat.shape", img_feat.shape)
 
             # 标准化动作 and qpos
             action_batch_norm = (action_batch - act_mean_full) / (act_std_full + 1e-12)
             qpos_batch_norm = (qpos_batch - qpos_mean_full) / (qpos_std_full + 1e-12)
 
-            # VAE takes (state, qpos_norm) and returns action in original scale
             pred_action, mu, std = vae(img_feat, qpos_batch_norm)
             pred_norm = (pred_action - act_mean_full) / (act_std_full + 1e-12)
 
@@ -415,17 +415,21 @@ def main():
             log_std = std.clamp_min(1e-8).log()
             kl = -0.5 * torch.mean(torch.sum(1 + 2*log_std - mu.pow(2) - std.pow(2), dim=1))
 
-            loss = rec_loss + kl
+            loss = rec_loss + beta * kl
 
             optim.zero_grad(set_to_none=True)
             loss.backward()
             optim.step()
 
             running += loss.item()
+            rec_loss_epoch += rec_loss.item()
+            kl_loss_epoch += kl.item()
 
         train_loss = running / max(1, len(train_dl))
+        rec_loss_epoch /= max(1, len(train_dl))
+        kl_loss_epoch /= max(1, len(train_dl))
         val_rec, val_kl = evaluate(feature_net, vae, val_dl, act_mean_full, act_std_full, qpos_mean_full, qpos_std_full, device)
-        monitor_val_loss =  val_rec + val_kl
+        monitor_val_loss =  val_rec + beta * val_kl
         val_loss = monitor_val_loss
         print(f"[epoch {epoch+1}/{epochs}] train_loss={train_loss:.4f} | "
             f"val_loss={val_loss:.4f} | "
@@ -434,6 +438,8 @@ def main():
         wandb.log({
             "epoch": epoch + 1,
             "train/loss": train_loss,
+            "train/rec_loss": rec_loss_epoch,
+            "train/kl_loss": kl_loss_epoch,
             "val/loss": val_loss,
             "val/rec_loss": val_rec,
             "val/kl_loss": val_kl,
