@@ -13,17 +13,12 @@ run:
   tpl: "{task}_L{model.latent_dim}_S{data.seed}_{date:%Y%m%d-%H%M%S}"
 
 paths:
-  train_h5_dataset_path: "/home/wzh-2004/RewardModelTest/Maniskill3_Baseline/demos/StackCube-v1/motionplanning/trajectory.rgb.pd_joint_delta_pos.physx_cpu.h5"
-  test_h5_dataset_path: "/home/wzh-2004/Downloads/trajectory.h5"   # 数据集路径
-  # test_h5_dataset_path: "/home/wzh-2004/RewardModelTest/Maniskill3_Baseline/demos/StackCube-v1/motionplanning/trajectory.rgb.pd_joint_delta_pos.physx_cpu.h5"   # 数据集路径
-  # h5_dataset_path: "/home/wzh-2004/RewardModelTest/Maniskill3_Baseline/demos/PushCube-v1/motionplanning/trajectory.rgb.pd_joint_delta_pos.physx_cpu.h5"
-
   ckpt_root: "${here}/ckpt/{model.name}" # 解析成：入口脚本(train.py)所在目录/ckpt_VAE
   # 也支持：
   # ckpt_root: "${cwd}/ckpt_VAE"  # 当前工作目录
   # ckpt_root: "${home}/proj/ckpt"_VAE"  # 用户主目录下的 proj/ckpt_VAE
   save_ckpt_dir: "{paths.ckpt_root}/{run}"
-  load_model_path: "/home/wzh-2004/ManiSkill3_Baselines/ms3_baselines/model/ckpt/VAE_ResNet/StackCube-v1_L8_S42_20251030-211351/vae_best.pt"
+  load_model_path: "/home/wzh-2004/ManiSkill3_Baselines/ms3_baselines/model/ckpt/VAE_ResNet/StackCube-v1_L8_S42_20251031-134613/vae_best.pt"
 
 data:
   img_size: null          # 例如: 128
@@ -35,10 +30,17 @@ data:
   max_samples_probe: 20000
 
 train:
+  h5_dataset_path: "/home/wzh-2004/RewardModelTest/Maniskill3_Baseline/demos/StackCube-v1/motionplanning/trajectory.rgb.pd_joint_delta_pos.physx_cpu.h5"
   epochs: 100
   lr: 1.0e-3
   min_lr: 1.0e-6
   plateau_patience: 5
+
+test:
+  h5_dataset_path: "/home/wzh-2004/RewardModelTest/Maniskill3_Baseline/demos/StackCube-v1/motionplanning/trajectory.rgb.pd_joint_delta_pos.physx_cpu.h5"   # 数据集路径
+  traj_id: 98
+  # test_h5_dataset_path: "/home/wzh-2004/Downloads/trajectory.h5"   # 数据集路径
+  # traj_id: 0
 
 reward:
   lambda_z: 0.2           # 潜空间能量权重

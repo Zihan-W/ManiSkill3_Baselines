@@ -38,7 +38,6 @@ class VAEReward:
                        device=device,
             ).to(device)
 
-
         _sd = torch.load(model_path, map_location=device)
 
         _feature_net_sd = _sd['feature_net']
@@ -140,16 +139,11 @@ class VAEReward:
             # 编码并用后验均值重构 (VAE.encode expects state, qpos_norm)
             z_in = self.vae.encode(img, qpos_norm)
             mu = self.vae.mean(z_in)
-            recon = self.vae.decode(img, mu)  # recon is action in original scale
+            recon_action = self.vae.decode(img, mu)  # recon is action in original scale
+            recon_norm = (recon_action - self.act_mean) / (self.act_std + 1e-12)
 
-            ## 第一种，不反归一化即输出奖励
-            # 计算重构奖励
-            # d = ((recon - action_norm) ** 2).mean(dim=1)  # (B,)
-
-            ## 第二种，反归一化即输出奖励
-            # recon 是标准化空间的输出 -> 反标准化回原动作空间
-            # recon is already in action space (original scale). Compute error directly.
-            d = ((recon - action) ** 2).mean(dim=1)
+            # 计算重构奖励，标准化空间输出奖励
+            d = ((recon_norm - action_norm) ** 2).mean(dim=1)  # (B,)
 
             distance_reward = -d  # 奖励是重构误差的负值
 
@@ -158,31 +152,6 @@ class VAEReward:
     def compute_penalty(self, forward_rewards, time_penalty_coef=0.01):
         time_penalty = - time_penalty_coef * torch.ones_like(forward_rewards)
         return time_penalty + forward_rewards
-
-def normalize_imagenet_6c(x, device):
-    # Accept list/tuple of tensors (collated oddly) or a tensor
-    if isinstance(x, (list, tuple)):
-        try:
-            x = torch.stack(x, dim=0)
-        except Exception:
-            # fallback: convert elements to tensor then stack
-            x = torch.stack([torch.as_tensor(xx) for xx in x], dim=0)
-
-    if not isinstance(x, torch.Tensor):
-        x = torch.as_tensor(x)
-
-    # ensure channel dimension exists
-    if x.dim() < 4:
-        raise ValueError(f"normalize_imagenet_6c expects a 4D tensor (B,C,H,W), got shape={x.shape}")
-
-    _dim = int(x.shape[1])
-    if _dim % 3 != 0:
-        raise ValueError(f"channel dimension {_dim} is not a multiple of 3 for Imagenet normalization")
-    _count = _dim // 3
-    mean = torch.tensor([0.485, 0.456, 0.406] * _count, device=device).view(1, _dim, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225] * _count, device=device).view(1, _dim, 1, 1)
-    x = x.to(device=device)
-    return (x - mean) / std
 
 @torch.no_grad()
 def evaluate(feature_net, vae, val_loader, act_mean, act_std, qpos_mean, qpos_std, device):
@@ -195,7 +164,6 @@ def evaluate(feature_net, vae, val_loader, act_mean, act_std, qpos_mean, qpos_st
     rec_total, kl_total, n_batch = 0.0, 0.0, 0.0
     for img_batch, action_batch, qpos_batch in val_loader:
         img_batch = img_batch.to(device, non_blocking=True)
-        img_batch = normalize_imagenet_6c(img_batch, device)
         action_batch = action_batch.to(device, non_blocking=True)
         qpos_batch = qpos_batch.to(device, non_blocking=True)
 
@@ -223,7 +191,7 @@ def testing():
     cfg = parse_cfg(cfg_name) if cfg_name is not None else parse_cfg()
 
     # 加载路径
-    h5_path = cfg["paths"]["test_h5_dataset_path"]
+    h5_path = cfg["test"]["h5_dataset_path"]
     save_eval_dir  = "runs/" + cfg['model']['name'] + "_" + cfg['task']  # 临时保存目录
     load_model_path= cfg["paths"]["load_model_path"]
     latent_dim = cfg["model"]["latent_dim"]
@@ -241,7 +209,7 @@ def testing():
     vae_reward = VAEReward(img, act, qpos, latent_dim, max_action, load_model_path, device)
 
     # 在单条轨迹上计算奖励
-    traj_id = 0
+    traj_id = cfg["test"]["traj_id"]
     traj_key = f"traj_{traj_id}"
 
     # 找到该 traj 的所有 dataset 索引（按时间顺序）
@@ -300,15 +268,15 @@ def main():
     cfg = parse_cfg(cfg_name) if cfg_name is not None else parse_cfg()
 
     # 加载路径
-    h5_path = cfg["paths"]["train_h5_dataset_path"]
+    h5_path = cfg["train"]["h5_dataset_path"]
     save_ckpt_dir = cfg["paths"]["save_ckpt_dir"]
     print(f"save_ckpt_dir: {save_ckpt_dir}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # 创建数据集和数据加载器ResNet
-    ds, dl = make_loader(h5_path, mode="single", img_size=None, num_workers=16, camera_mask=['base'])
-    pair_ds, pair_dl = make_loader(h5_path, mode="pair", batch_size=265, num_workers=16, camera_mask=['base'])
+    ds, dl = make_loader(h5_path, mode="single", img_size=None, num_workers=16, camera_mask=None)
+    pair_ds, pair_dl = make_loader(h5_path, mode="pair", batch_size=265, num_workers=16, camera_mask=None)
 
     # 划分训练集和验证集
     train_ds, val_ds = split_by_trajectory(ds, val_ratio=0.1, seed=42)
@@ -395,7 +363,6 @@ def main():
 
         for img_batch, action_batch, qpos_batch in train_dl:
             img_batch = img_batch.to(device)       # (B, 2C, H, W)
-            img_batch = normalize_imagenet_6c(img_batch, device)
             action_batch = action_batch.to(device) # (B, A)
             qpos_batch = qpos_batch.to(device)     # (B, Q)
             # imgs: (B, C, H, W)  acts: (B, A)

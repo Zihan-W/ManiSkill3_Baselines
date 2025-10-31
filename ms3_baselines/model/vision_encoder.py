@@ -59,7 +59,33 @@ class ModifiedResNet(nn.Module):
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(512, feat_dim)
 
+    def normalize_imagenet(x, device):
+        # Accept list/tuple of tensors (collated oddly) or a tensor
+        if isinstance(x, (list, tuple)):
+            try:
+                x = torch.stack(x, dim=0)
+            except Exception:
+                # fallback: convert elements to tensor then stack
+                x = torch.stack([torch.as_tensor(xx) for xx in x], dim=0)
+
+        if not isinstance(x, torch.Tensor):
+            x = torch.as_tensor(x)
+
+        # ensure channel dimension exists
+        if x.dim() < 4:
+            raise ValueError(f"normalize_imagenet_6c expects a 4D tensor (B,C,H,W), got shape={x.shape}")
+
+        _dim = int(x.shape[1])
+        if _dim % 3 != 0:
+            raise ValueError(f"channel dimension {_dim} is not a multiple of 3 for Imagenet normalization")
+        _count = _dim // 3
+        mean = torch.tensor([0.485, 0.456, 0.406] * _count, device=device).view(1, _dim, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225] * _count, device=device).view(1, _dim, 1, 1)
+        x = x.to(device=device)
+        return (x - mean) / std
+
     def forward(self, x):
+        x = self.normalize_imagenet(x, device=x.device)
         x = self.feature_extractor(x)  # (B, 512, H/32, W/32)
         x = self.pool(x).flatten(1)    # (B, 512)
         x = self.fc(x)                 # (B, output_dim)
